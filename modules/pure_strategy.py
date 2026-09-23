@@ -48,6 +48,8 @@ def _zone_map(snapshot):
     rows = []
     for zone_name in ("raw_value_zone", "eligible_value_zone"):
         rows.extend((snapshot.get(zone_name) or {}).get("stocks") or [])
+    # ARK daily snapshot 也會提供全部既有持股的 NAV；降水位／溢價判斷不能只限價值區。
+    rows.extend(snapshot.get("holdings") or [])
     result = {}
     for row in rows:
         if isinstance(row, dict) and _symbol(row.get("symbol")):
