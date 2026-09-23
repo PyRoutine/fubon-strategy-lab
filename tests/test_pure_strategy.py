@@ -759,6 +759,121 @@ class PureStrategyTests(unittest.TestCase):
             self.assertGreater(leg["quantity"], 0)
             self.assertGreater(leg["limit_price"], 0)
 
+    def test_app_risk_reduction_rounds_target_up_to_thousand_and_suppresses_buys(self):
+        data = snapshot(eligible=("0050", "006208"), shares=10)
+        data["risk_control"] = {
+            "risk_reduction_required": True,
+            "app_recommended_holding_amount": 176_880,
+        }
+        plan = build_strategy_plan(data, portfolio(0, {
+            "1111": {"qty": 1000, "avg_cost": 120},
+            "2222": {"qty": 1000, "avg_cost": 90},
+        }), {
+            "0050": quote(), "006208": quote(),
+            "1111": quote(), "2222": quote(),
+        })
+        self.assertEqual(plan["waterline_reduction"]["type"], "APP_RISK_REDUCTION")
+        self.assertEqual(plan["waterline_reduction"]["target_amount"], 24_000)
+        self.assertTrue(plan["suppress_buys"])
+        self.assertEqual(build_affordable_buys(plan, 100_000, 100_000), [])
+        self.assertGreaterEqual(plan["planned_sell_amount"], 24_000)
+        self.assertEqual(plan["planned_sells"][0]["symbol"], "1111")
+
+    def test_app_risk_reduction_all_positive_starts_from_smallest_profit_amount(self):
+        data = snapshot(eligible=("0050",), shares=10)
+        data["risk_control"] = {
+            "risk_reduction_required": True,
+            "app_recommended_holding_amount": 190_000,
+        }
+        plan = build_strategy_plan(data, portfolio(0, {
+            "1111": {"qty": 1000, "avg_cost": 99},
+            "2222": {"qty": 1000, "avg_cost": 90},
+        }), {
+            "0050": quote(), "1111": quote(), "2222": quote(),
+        })
+        self.assertEqual(plan["planned_sells"][0]["symbol"], "1111")
+        self.assertEqual(plan["planned_sells"][0]["reason_code"], "APP_WATERLINE_REDUCTION")
+
+    def test_concentration_reduction_disables_n_and_keeps_only_one_x(self):
+        rows = [
+            {"symbol": "0050", "nav": 100, "app_shares": 0},
+            {"symbol": "006208", "nav": 100, "app_shares": 0},
+            {"symbol": "00875", "nav": 100, "app_shares": 10},
+            {"symbol": "00960", "nav": 100, "app_shares": 0},
+        ]
+        data = {
+            "snapshot_id": "concentration",
+            "account": "fixture@example.invalid",
+            "eligible_value_zone": {"stocks": rows},
+            "raw_value_zone": {"stocks": rows},
+            "warming_zone": {"cross_table": []},
+        }
+        plan = build_strategy_plan(data, portfolio(0, {
+            "1111": {"qty": 5000, "avg_cost": 80},
+        }), {
+            "0050": quote(), "006208": quote(), "00875": quote(), "00960": quote(),
+            "1111": quote(board_bid=102, odd_bid=102),
+        })
+        self.assertEqual(plan["waterline_reduction"]["type"], "CONCENTRATION_REDUCTION")
+        self.assertEqual(plan["rotation_multiplier"], 0)
+        self.assertTrue(plan["base_only_buys"])
+        buys = build_affordable_buys(plan, 100_000, plan["planned_sell_amount"])
+        self.assertEqual(sum(x["quantity"] for x in buys if x["symbol"] == "00875"), 10)
+
+    def test_concentration_equal_half_does_not_trigger(self):
+        rows = [
+            {"symbol": "0050", "nav": 100, "app_shares": 10},
+            {"symbol": "006208", "nav": 100, "app_shares": 10},
+            {"symbol": "00875", "nav": 100, "app_shares": 0},
+            {"symbol": "00960", "nav": 100, "app_shares": 0},
+        ]
+        data = {
+            "snapshot_id": "half",
+            "account": "fixture@example.invalid",
+            "eligible_value_zone": {"stocks": rows},
+            "raw_value_zone": {"stocks": rows},
+            "warming_zone": {"cross_table": []},
+        }
+        plan = build_strategy_plan(data, portfolio(0, {
+            "1111": {"qty": 5000, "avg_cost": 80},
+        }), {
+            "0050": quote(), "006208": quote(), "00875": quote(), "00960": quote(),
+            "1111": quote(),
+        })
+        self.assertFalse(plan["waterline_reduction"]["active"])
+        self.assertGreater(plan["rotation_multiplier"], 0)
+
+    def test_concentration_weak_cleanup_realized_pnl_never_negative(self):
+        rows = [
+            {"symbol": "0050", "nav": 100, "app_shares": 10},
+            {"symbol": "006208", "nav": 100, "app_shares": 0},
+            {"symbol": "00875", "nav": 100, "app_shares": 0},
+            {"symbol": "00960", "nav": 100, "app_shares": 0},
+        ]
+        data = {
+            "snapshot_id": "cover-loss",
+            "account": "fixture@example.invalid",
+            "eligible_value_zone": {"stocks": rows},
+            "raw_value_zone": {"stocks": rows},
+            "warming_zone": {"cross_table": []},
+        }
+        plan = build_strategy_plan(data, portfolio(0, {
+            "0050": {"qty": 100, "avg_cost": 90},
+            "1111": {"qty": 100, "avg_cost": 120},
+            "2222": {"qty": 100, "avg_cost": 110},
+        }), {
+            "0050": quote(board_bid=102, odd_bid=102),
+            "006208": quote(), "00875": quote(), "00960": quote(),
+            "1111": quote(board_bid=100, odd_bid=100),
+            "2222": quote(board_bid=100, odd_bid=100),
+        })
+        reduction = plan["waterline_reduction"]
+        self.assertEqual(reduction["type"], "CONCENTRATION_REDUCTION")
+        self.assertGreaterEqual(reduction["realized_pnl"], -0.01)
+        weak = [x for x in reduction["planned_sells"] if x["reason_code"] == "CONCENTRATION_WEAK_REDUCTION"]
+        self.assertTrue(weak)
+        self.assertEqual(weak[0]["symbol"], "1111")
+
     def test_spiral_uses_positive_return_highest_premium_seller_and_app_quantity(self):
         data = snapshot(eligible=("0050", "006208"), shares=10)
         data["app_adjustments"] = {"stocks": [
