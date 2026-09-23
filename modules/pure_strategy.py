@@ -436,7 +436,8 @@ def build_strategy_plan(ark_snapshot, portfolio, live_quotes, *, spiral=None, no
     # LOW：不為籌資賣虧損股；僅把升溫已實現獲利配對成等額 P1 虧損。
     low_loss_offset_legs = []
     remaining_offset = warm_realized_profit
-    for item in sorted(low_loss_candidates, key=lambda row: (row["unrealized_pnl"], row["symbol"])):
+    # LOW 弱勢整理：報酬率最差優先，且每天最多 2 檔。
+    for item in sorted(low_loss_candidates, key=lambda row: (row["return_pct"], row["symbol"]))[:2]:
         if remaining_offset <= 0:
             break
         loss_per_share = max(0.0, -item["unrealized_pnl"] / item["qty"])
