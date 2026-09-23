@@ -485,7 +485,6 @@ def build_strategy_plan(ark_snapshot, portfolio, live_quotes, *, spiral=None, no
         if leg not in selected:
             selected.append(leg)
             selected_amount += leg["estimated_amount"]
-    selected.sort(key=lambda leg: (0 if leg in mandatory else 1, leg["symbol"], leg["market"]))
     for leg in selected:
         if leg in mandatory:
             leg["reason_code"] = "WARM_MANDATORY"
