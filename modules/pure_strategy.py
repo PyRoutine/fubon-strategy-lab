@@ -296,7 +296,7 @@ def _build_spiral_plan(snapshot, holdings, selected_sells):
                 sell_amount = sum(leg["estimated_amount"] for leg in sell_legs)
                 bid_premium = (sell_amount / sell_qty - item["nav"]) / item["nav"] * 100
                 sellers.append((bid_premium, item, sell_qty, sell_legs))
-        if ask_premium is not None:
+        if item["is_eligible"] and ask_premium is not None:
             buyers.append((ask_premium, item))
     if not sellers or len(buyers) < 2:
         return None
