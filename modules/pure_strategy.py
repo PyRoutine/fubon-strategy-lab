@@ -217,7 +217,8 @@ def build_affordable_buys(plan, cash, submitted_sell_amount=0.0):
         if discount is None:
             continue
         targets.append((discount, _symbol(target.get("symbol")), desired, nav, quote))
-    buys = []    for discount, symbol, desired, nav, quote in sorted(targets, key=lambda row: (row[0], row[1])):
+    buys = []
+    for discount, symbol, desired, nav, quote in sorted(targets, key=lambda row: (row[0], row[1])):
         affordable = min(desired, floor(available_cash / nav))
         legs = _buy_legs(symbol, affordable, quote, nav,
             "LOW：App 位階股數×2，不扣既有庫存。" if plan.get("mode") == "LOW"
@@ -516,7 +517,8 @@ def build_strategy_plan(ark_snapshot, portfolio, live_quotes, *, spiral=None, no
         "strategy_generated_at": generated_at.isoformat(),
         "valid_until": valid_until.isoformat(),
         "actual_waterline_pct": round(waterline, 6), "x_amount": round(x_amount, 2),
-        "expected_sell_capacity": round(capacity, 2), "rotation_capacity": round(capacity, 2),        "rotation_multiplier": n, "target_multiplier": multiplier,
+        "expected_sell_capacity": round(capacity, 2), "rotation_capacity": round(capacity, 2),
+        "rotation_multiplier": n, "target_multiplier": multiplier,
         "rotation_target_amount": round(target_sell, 2),
         "rotation_remaining_amount": round(max(0, target_sell - selected_amount), 2),
         "funding_source": "；".join(explanations) or ("P 排序可調節持股" if mode == "HIGH" else "LOW 不需調節"),
