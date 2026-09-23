@@ -1,0 +1,31 @@
+name: Pure strategy tests
+
+on:
+  push:
+    paths:
+      - "modules/**"
+      - "tests/**"
+      - ".github/workflows/pure-strategy-tests.yml"
+  pull_request:
+    paths:
+      - "modules/**"
+      - "tests/**"
+      - ".github/workflows/pure-strategy-tests.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Verify syntax
+        run: python -m py_compile modules/pure_strategy.py tests/test_pure_strategy.py
+      - name: Run pure strategy tests
+        run: python -m unittest discover -s tests -p "test_*.py" -v
