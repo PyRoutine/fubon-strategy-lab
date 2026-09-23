@@ -204,6 +204,25 @@ class PureStrategyTests(unittest.TestCase):
         self.assertEqual(result["spiral_plan"]["seller_symbol"], "0050")
         self.assertEqual(result["spiral_plan"]["buyer_symbol"], "006208")
 
+    def test_spiral_plan_builds_sell_and_buy_legs(self):
+        data = snapshot(eligible=("0050", "006208"), shares=10)
+        data["app_adjustments"] = {"stocks": [{"symbol": "0050", "app_reduce_min_shares": 20}]}
+        plan = build_strategy_plan(data, portfolio(100_000, {
+            "0050": {"qty": 100, "avg_cost": 90},
+        }), {
+            "0050": quote(board_bid=102, board_ask=103, odd_bid=102, odd_ask=103),
+            "006208": quote(board_bid=99, board_ask=99, odd_bid=99, odd_ask=99),
+        })
+        spiral = plan["spiral_plan"]
+        self.assertEqual(sum(x["quantity"] for x in spiral["seller_legs"]), 20)
+        self.assertTrue(all(x["reason_code"] == "SPIRAL_SELL" for x in spiral["seller_legs"]))
+        self.assertEqual(
+            sum(x["quantity"] for x in spiral["buyer_legs"]),
+            spiral["buyer_max_qty"],
+        )
+        self.assertTrue(all(x["reason_code"] == "SPIRAL_BUY" for x in spiral["buyer_legs"]))
+        self.assertTrue(all(x["limit_price"] == spiral["buyer_nav"] for x in spiral["buyer_legs"]))
+
     def test_spiral_buyer_does_not_need_existing_holding(self):
         data = snapshot(eligible=("0050", "006208"), shares=10)
         data["app_adjustments"] = {"stocks": [{"symbol": "0050", "app_reduce_min_shares": 20}]}
