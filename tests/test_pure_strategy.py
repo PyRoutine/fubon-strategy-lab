@@ -68,7 +68,7 @@ class PureStrategyTests(unittest.TestCase):
 
     def test_low_loss_offsets_at_most_two_and_worst_return_first(self):
         data = snapshot(eligible=("0050",), warming=("0050",))
-        plan = build_strategy_plan(data, portfolio(100_000, {
+        plan = build_strategy_plan(data, portfolio(300_000, {
             "0050": {"qty": 1000, "avg_cost": 50},
             "1111": {"qty": 100, "avg_cost": 120},
             "2222": {"qty": 100, "avg_cost": 130},
