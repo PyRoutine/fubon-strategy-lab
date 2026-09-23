@@ -250,6 +250,97 @@ class PureStrategyTests(unittest.TestCase):
         })
         self.assertIsNone(plan["spiral_plan"])
 
+    def test_high_planned_sells_keep_p1_p2_p3_p4_order(self):
+        data = snapshot(eligible=("0050",), shares=100)
+        plan = build_strategy_plan(data, portfolio(0, {
+            "1111": {"qty": 60, "avg_cost": 120},
+            "2222": {"qty": 50, "avg_cost": 103},
+            "3333": {"qty": 50, "avg_cost": 90},
+            "0050": {"qty": 100, "avg_cost": 90},
+        }), {
+            "1111": quote(), "2222": quote(), "3333": quote(), "0050": quote(),
+        })
+        self.assertEqual(plan["rotation_multiplier"], 2)
+        self.assertEqual(
+            [leg["reason_code"] for leg in plan["planned_sells"]],
+            ["P1", "P2", "P3", "P4"],
+        )
+        self.assertEqual(sum(leg["estimated_amount"] for leg in plan["planned_sells"]), 20_000)
+
+    def test_p1_sorts_by_larger_unrealized_loss_amount(self):
+        plan = build_strategy_plan(snapshot(), portfolio(0, {
+            "1111": {"qty": 1000, "avg_cost": 120},
+            "2222": {"qty": 3000, "avg_cost": 110},
+        }), {
+            "0050": quote(), "1111": quote(), "2222": quote(),
+        })
+        rows = [row for row in plan["rotation_candidates"] if row["priority"] == "P1"]
+        self.assertEqual([row["symbol"] for row in rows], ["2222", "1111"])
+
+    def test_p3_sorts_by_larger_positive_unrealized_amount(self):
+        plan = build_strategy_plan(snapshot(), portfolio(0, {
+            "1111": {"qty": 1000, "avg_cost": 90},
+            "2222": {"qty": 3000, "avg_cost": 95},
+        }), {
+            "0050": quote(), "1111": quote(), "2222": quote(),
+        })
+        rows = [row for row in plan["rotation_candidates"] if row["priority"] == "P3"]
+        self.assertEqual([row["symbol"] for row in rows], ["2222", "1111"])
+
+    def test_p4_sorts_by_larger_positive_unrealized_amount(self):
+        data = snapshot(eligible=("0050", "006208"), shares=1)
+        plan = build_strategy_plan(data, portfolio(0, {
+            "0050": {"qty": 1000, "avg_cost": 90},
+            "006208": {"qty": 2000, "avg_cost": 90},
+        }), {
+            "0050": quote(board_bid=101, odd_bid=101),
+            "006208": quote(board_bid=101, odd_bid=101),
+        })
+        rows = [row for row in plan["rotation_candidates"] if row["priority"] == "P4"]
+        self.assertEqual([row["symbol"] for row in rows], ["006208", "0050"])
+
+    def test_warming_mandatory_sale_is_not_cut_down_by_five_x_target(self):
+        data = snapshot(eligible=("0050",), shares=10, warming=("0050",))
+        plan = build_strategy_plan(data, portfolio(0, {
+            "0050": {"qty": 100, "avg_cost": 90},
+        }), {
+            "0050": quote(),
+        })
+        self.assertEqual(plan["rotation_multiplier"], 5)
+        self.assertEqual(plan["rotation_target_amount"], 5_000)
+        self.assertEqual(sum(leg["quantity"] for leg in plan["planned_sells"]), 100)
+        self.assertEqual(sum(leg["estimated_amount"] for leg in plan["planned_sells"]), 10_000)
+        self.assertTrue(all(leg["reason_code"] == "WARM_MANDATORY" for leg in plan["planned_sells"]))
+
+    def test_spiral_gap_exactly_half_percent_does_not_trade(self):
+        data = snapshot(eligible=("0050", "006208"), shares=10)
+        data["app_adjustments"] = {"stocks": [{"symbol": "0050", "app_reduce_min_shares": 20}]}
+        plan = build_strategy_plan(data, portfolio(100_000, {
+            "0050": {"qty": 100, "avg_cost": 90},
+        }), {
+            "0050": quote(board_bid=100.5, odd_bid=100.5, board_ask=101, odd_ask=101),
+            "006208": quote(board_bid=100, odd_bid=100, board_ask=100, odd_ask=100),
+        })
+        self.assertIsNone(plan["spiral_plan"])
+
+    def test_spiral_gap_just_over_half_percent_can_trade(self):
+        data = snapshot(eligible=("0050", "006208"), shares=10)
+        data["app_adjustments"] = {"stocks": [{"symbol": "0050", "app_reduce_min_shares": 20}]}
+        plan = build_strategy_plan(data, portfolio(100_000, {
+            "0050": {"qty": 100, "avg_cost": 90},
+        }), {
+            "0050": quote(board_bid=100.5001, odd_bid=100.5001, board_ask=101, odd_ask=101),
+            "006208": quote(board_bid=100, odd_bid=100, board_ask=100, odd_ask=100),
+        })
+        self.assertIsNotNone(plan["spiral_plan"])
+        self.assertGreater(plan["spiral_plan"]["premium_gap_pct"], 0.5)
+
+    def test_zero_app_shares_creates_no_buy_order(self):
+        data = snapshot(eligible=("0050",), shares=0)
+        plan = build_strategy_plan(data, portfolio(10_000, {}), {"0050": quote()})
+        self.assertEqual(plan["x_amount"], 0)
+        self.assertEqual(build_affordable_buys(plan, 10_000), [])
+
     def test_spiral_uses_positive_return_highest_premium_seller_and_app_quantity(self):
         data = snapshot(eligible=("0050", "006208"), shares=10)
         data["app_adjustments"] = {"stocks": [
