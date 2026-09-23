@@ -484,6 +484,126 @@ class PureStrategyTests(unittest.TestCase):
                 self.assertGreater(spiral["premium_gap_pct"], 0.5)
                 self.assertLessEqual(spiral["seller_planned_qty"], original_qty[spiral["seller_symbol"]])
 
+    def test_ark_real_shape_100_shadow_cases(self):
+        """以兩次真實 ARK snapshot 的策略欄位形狀為基底，隨機化私人庫存後跑 100 組。"""
+        baselines = [
+            {
+                "eligible": [
+                    ("0053", 254.15, 2), ("0052", 65.88, 9), ("00631L", 39.43, 15),
+                    ("0050", 113.11, 5), ("0055", 49.86, 13), ("0056", 56.71, 10),
+                    ("00911", 57.32, 10), ("00960", 22.24, 31), ("00875", 57.74, 9),
+                ],
+                "excluded": [("0057", 336.49, 0)],
+                "warming": {"00960"},
+            },
+            {
+                "eligible": [
+                    ("0053", 251.03, 0), ("0052", 64.91, 0), ("00631L", 38.58, 0),
+                    ("0050", 111.83, 0), ("006208", 255.90, 0), ("006201", 46.87, 0),
+                    ("0055", 50.21, 0), ("00911", 56.01, 0), ("0056", 56.70, 0),
+                    ("00875", 57.89, 0), ("00960", 22.69, 1),
+                ],
+                "excluded": [("0057", 332.44, 0), ("006203", 202.82, 0)],
+                "warming": {"00960"},
+            },
+        ]
+        rng = random.Random(35805463471 ^ 35706480249)
+
+        for case in range(100):
+            base = baselines[case % 2]
+            eligible_rows = [
+                {"symbol": symbol, "nav": nav, "app_shares": shares}
+                for symbol, nav, shares in base["eligible"]
+            ]
+            excluded_rows = [
+                {"symbol": symbol, "nav": nav, "app_shares": shares}
+                for symbol, nav, shares in base["excluded"]
+            ]
+            all_zone_rows = eligible_rows + excluded_rows
+            nav_by_symbol = {row["symbol"]: row["nav"] for row in all_zone_rows}
+
+            holdings = {}
+            quotes = {}
+            adjustment_rows = []
+            universe = [row["symbol"] for row in all_zone_rows] + ["2308", "2330", "00830", "00861"]
+
+            for symbol in universe:
+                nav = nav_by_symbol.get(symbol, rng.uniform(25, 250))
+                board_bid = nav * rng.uniform(0.97, 1.03)
+                board_ask = nav * rng.uniform(0.97, 1.03)
+                quotes[symbol] = quote(
+                    price=nav * rng.uniform(0.99, 1.01),
+                    board_bid=board_bid,
+                    board_ask=board_ask,
+                    odd_bid=board_bid * rng.uniform(0.995, 1.005),
+                    odd_ask=board_ask * rng.uniform(0.995, 1.005),
+                )
+                if rng.random() < 0.65:
+                    qty = rng.randint(1, 3500)
+                    avg_cost = nav * rng.uniform(0.70, 1.35)
+                    holdings[symbol] = {"qty": qty, "avg_cost": avg_cost}
+                    if symbol in nav_by_symbol and rng.random() < 0.7:
+                        adjustment_rows.append({
+                            "symbol": symbol,
+                            "app_reduce_min_shares": rng.randint(0, qty),
+                        })
+
+            data = {
+                "snapshot_id": f"ark-real-shape-{case}",
+                "account": "sanitized-fixture@example.invalid",
+                "eligible_value_zone": {"stocks": eligible_rows},
+                "raw_value_zone": {"stocks": all_zone_rows},
+                "warming_zone": {
+                    "cross_table": [
+                        {"symbol": symbol, "is_warming": True}
+                        for symbol in base["warming"]
+                    ]
+                },
+                "app_adjustments": {"stocks": adjustment_rows},
+            }
+            cash = rng.uniform(0, 900_000)
+            plan = build_strategy_plan(data, portfolio(cash, holdings), quotes)
+
+            self.assertIn(plan["mode"], ("LOW", "HIGH"))
+            self.assertGreaterEqual(plan["rotation_multiplier"], 0)
+            self.assertLessEqual(plan["rotation_multiplier"], 5)
+            if plan["mode"] == "LOW":
+                self.assertEqual(plan["rotation_multiplier"], 0)
+
+            sold = {}
+            for leg in plan["planned_sells"]:
+                sold[leg["symbol"]] = sold.get(leg["symbol"], 0) + leg["quantity"]
+                self.assertGreater(leg["quantity"], 0)
+                self.assertIn(leg["market"], ("整股", "零股"))
+                if leg.get("reason_code") == "P4":
+                    self.assertGreaterEqual(leg["limit_price"], nav_by_symbol[leg["symbol"]])
+            for symbol, qty in sold.items():
+                self.assertLessEqual(qty, holdings[symbol]["qty"])
+
+            buys = build_affordable_buys(
+                plan,
+                cash,
+                plan["rotation_target_amount"] * rng.random() if plan["mode"] == "HIGH" else 0,
+            )
+            for leg in buys:
+                self.assertIn(leg["symbol"], {row["symbol"] for row in eligible_rows})
+                self.assertGreater(leg["quantity"], 0)
+                self.assertEqual(leg["limit_price"], nav_by_symbol[leg["symbol"]])
+
+            spiral = plan.get("spiral_plan")
+            if spiral:
+                self.assertNotEqual(spiral["seller_symbol"], spiral["buyer_symbol"])
+                self.assertIn(spiral["buyer_symbol"], {row["symbol"] for row in eligible_rows})
+                self.assertGreater(spiral["premium_gap_pct"], 0.5)
+                self.assertLessEqual(
+                    spiral["seller_planned_qty"],
+                    holdings[spiral["seller_symbol"]]["qty"] - sold.get(spiral["seller_symbol"], 0),
+                )
+                self.assertEqual(
+                    sum(leg["quantity"] for leg in spiral["buyer_legs"]),
+                    spiral["buyer_max_qty"],
+                )
+
     def test_spiral_uses_positive_return_highest_premium_seller_and_app_quantity(self):
         data = snapshot(eligible=("0050", "006208"), shares=10)
         data["app_adjustments"] = {"stocks": [
