@@ -291,7 +291,10 @@ def _build_spiral_plan(snapshot, holdings, selected_sells, eligible_rows=None, l
             sell_legs = _sell_legs(item["symbol"], sell_qty, item["quote"], item["nav"])
             if sum(leg["quantity"] for leg in sell_legs) == sell_qty:
                 sell_amount = sum(leg["estimated_amount"] for leg in sell_legs)
-                bid_premium = (sell_amount / sell_qty - item["nav"]) / item["nav"] * 100
+                exact_sell_value = sum(
+                    leg["quantity"] * leg["limit_price"] for leg in sell_legs
+                )
+                bid_premium = (exact_sell_value / sell_qty - item["nav"]) / item["nav"] * 100
                 sellers.append((bid_premium, item, sell_qty, sell_legs))
 
     holding_by_symbol = {item["symbol"]: item for item in holdings}
