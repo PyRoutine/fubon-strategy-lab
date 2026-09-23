@@ -1,7 +1,7 @@
 """新版 SOP 的唯一純策略引擎；不讀寫資料庫、不送券商委託。"""
 from __future__ import annotations
 
-from math import floor
+from math import ceil, floor
 from datetime import datetime, time, timedelta, timezone
 
 
@@ -196,12 +196,156 @@ def _partial_candidate_legs(item, amount_needed, *, protected=False):
     return answer
 
 
+
+def _realized_pnl_for_legs(item, legs):
+    return sum((leg["limit_price"] - item["avg_cost"]) * leg["quantity"] for leg in legs)
+
+
+def _sell_to_amount(item, amount_needed, *, reason_code, reason):
+    """賣到指定市值；最後一檔允許部分賣出。"""
+    if amount_needed <= 0:
+        return []
+    full = _sell_legs(item["symbol"], item["qty"], item["quote"], item["nav"])
+    full_amount = sum(leg["estimated_amount"] for leg in full)
+    if full_amount <= amount_needed:
+        legs = full
+    else:
+        legs = _partial_candidate_legs(item, amount_needed)
+    for leg in legs:
+        leg["reason_code"] = reason_code
+        leg["reason"] = reason
+    return legs
+
+
+def waterline_reduction_engine(snapshot, holdings, holding_value, eligible_rows):
+    """共用降水位引擎：App 強制調節，或位階股數過度集中。"""
+    risk = snapshot.get("risk_control") or {}
+    app_required = bool(risk.get("risk_reduction_required"))
+    recommended = risk.get("app_recommended_holding_amount")
+
+    if app_required:
+        if recommended is None:
+            raise ValueError("App 要求調節，但缺少建議持股金額")
+        raw_target = max(0.0, holding_value - _num(recommended, "App 建議持股金額"))
+        target = ceil(raw_target / 1000.0) * 1000.0 if raw_target > 0 else 0.0
+        selected = []
+        selected_amount = 0.0
+        for item in sorted(holdings, key=lambda row: (row["unrealized_pnl"], row["symbol"])):
+            if selected_amount >= target:
+                break
+            legs = _sell_to_amount(
+                item,
+                target - selected_amount,
+                reason_code="APP_WATERLINE_REDUCTION",
+                reason="App 明確要求降水位：依未實現報酬金額由低到高調節至建議持股金額。",
+            )
+            selected.extend(legs)
+            selected_amount += sum(leg["estimated_amount"] for leg in legs)
+        return {
+            "active": True,
+            "type": "APP_RISK_REDUCTION",
+            "target_amount": round(target, 2),
+            "planned_sells": selected,
+            "planned_sell_amount": round(selected_amount, 2),
+            "suppress_buys": True,
+            "base_only": False,
+            "positive_app_share_count": sum(
+                1 for row in eligible_rows.values()
+                if int(_num(row.get("app_shares", 0) or 0, "App 位階股數")) > 0
+            ),
+            "eligible_count": len(eligible_rows),
+        }
+
+    positive_count = sum(
+        1 for row in eligible_rows.values()
+        if int(_num(row.get("app_shares", 0) or 0, "App 位階股數")) > 0
+    )
+    concentration = bool(eligible_rows) and positive_count * 2 < len(eligible_rows)
+    if not concentration:
+        return {
+            "active": False, "type": None, "target_amount": 0.0, "planned_sells": [],
+            "planned_sell_amount": 0.0, "suppress_buys": False, "base_only": False,
+            "positive_app_share_count": positive_count, "eligible_count": len(eligible_rows),
+        }
+
+    # 位階股數過度集中：正報酬且實際賣價高於 NAV 的庫存先全部獲利了結，
+    # 再以這些已實現獲利 cover 報酬金額最低的負報酬庫存；整體實現損益不得為負。
+    profit_legs = []
+    realized_profit = 0.0
+    profit_symbols = set()
+    for item in holdings:
+        if item["return_pct"] <= 0 or not item["nav"]:
+            continue
+        legs = _sell_legs(item["symbol"], item["qty"], item["quote"], item["nav"])
+        if not legs or any(leg["limit_price"] <= item["nav"] for leg in legs):
+            continue
+        pnl = _realized_pnl_for_legs(item, legs)
+        if pnl <= 0:
+            continue
+        for leg in legs:
+            leg["reason_code"] = "CONCENTRATION_PROFIT_REDUCTION"
+            leg["reason"] = "有效價值區可買檔數不足一半：正報酬且溢價庫存先獲利了結以降低水位。"
+        profit_legs.extend(legs)
+        realized_profit += pnl
+        profit_symbols.add(item["symbol"])
+
+    weak_legs = []
+    loss_budget = realized_profit
+    for item in sorted(holdings, key=lambda row: (row["unrealized_pnl"], row["symbol"])):
+        if item["symbol"] in profit_symbols or item["unrealized_pnl"] >= 0 or loss_budget <= 0:
+            continue
+        loss_per_share = max(0.0, -item["unrealized_pnl"] / item["qty"])
+        if loss_per_share <= 0:
+            continue
+        qty = min(item["qty"], int(loss_budget // loss_per_share))
+        if qty <= 0:
+            continue
+        legs = _sell_legs(item["symbol"], qty, item["quote"], item["nav"])
+        actual_loss = max(0.0, -_realized_pnl_for_legs(item, legs))
+        while legs and actual_loss > loss_budget + 1e-9:
+            qty -= 1
+            if qty <= 0:
+                legs = []
+                break
+            legs = _sell_legs(item["symbol"], qty, item["quote"], item["nav"])
+            actual_loss = max(0.0, -_realized_pnl_for_legs(item, legs))
+        for leg in legs:
+            leg["reason_code"] = "CONCENTRATION_WEAK_REDUCTION"
+            leg["reason"] = "有效價值區可買檔數不足一半：以溢價獲利庫存的已實現獲利 cover 弱勢庫存，總實現損益不得為負。"
+        weak_legs.extend(legs)
+        loss_budget -= actual_loss
+
+    selected = profit_legs + weak_legs
+    realized_total = realized_profit + sum(
+        _realized_pnl_for_legs(
+            next(item for item in holdings if item["symbol"] == symbol),
+            [leg for leg in weak_legs if leg["symbol"] == symbol],
+        )
+        for symbol in {leg["symbol"] for leg in weak_legs}
+    )
+    return {
+        "active": True,
+        "type": "CONCENTRATION_REDUCTION",
+        "target_amount": 0.0,
+        "planned_sells": selected,
+        "planned_sell_amount": round(sum(leg["estimated_amount"] for leg in selected), 2),
+        "realized_pnl": round(realized_total, 2),
+        "suppress_buys": False,
+        "base_only": True,
+        "positive_app_share_count": positive_count,
+        "eligible_count": len(eligible_rows),
+    }
+
+
 def build_affordable_buys(plan, cash, submitted_sell_amount=0.0):
     """送出賣單後唯一的買單重算器：不等成交，只使用成功送出的賣單估計金額。"""
     if not isinstance(plan, dict):
         raise ValueError("策略計畫格式不正確")
+    if plan.get("suppress_buys"):
+        return []
     available_cash = _num(cash, "可用現金") + max(0.0, _num(submitted_sell_amount, "成功送出賣單金額"))
     n = int(plan.get("rotation_multiplier", 0) or 0)
+    base_only = bool(plan.get("base_only_buys"))
     if plan.get("mode") == "HIGH":
         rotation_target = _num(plan.get("rotation_target_amount", 0), "N 資金目標")
         scale = min(1.0, max(0.0, _num(submitted_sell_amount, "成功送出賣單金額") / rotation_target)) if rotation_target else 0.0
@@ -212,7 +356,10 @@ def build_affordable_buys(plan, cash, submitted_sell_amount=0.0):
         nav = _num(target.get("nav"), "NAV")
         quote = target.get("quote") or {}
         app_shares = int(_num(target.get("app_shares"), "App 位階股數"))
-        desired = app_shares * 2 if plan.get("mode") == "LOW" else app_shares + floor(app_shares * n * scale)
+        if base_only:
+            desired = app_shares
+        else:
+            desired = app_shares * 2 if plan.get("mode") == "LOW" else app_shares + floor(app_shares * n * scale)
         discount = _buy_discount_pct(quote, nav, desired)
         if discount is None:
             continue
@@ -221,8 +368,9 @@ def build_affordable_buys(plan, cash, submitted_sell_amount=0.0):
     for discount, symbol, desired, nav, quote in sorted(targets, key=lambda row: (row[0], row[1])):
         affordable = min(desired, floor(available_cash / nav))
         legs = _buy_legs(symbol, affordable, quote, nav,
-            "LOW：App 位階股數×2，不扣既有庫存。" if plan.get("mode") == "LOW"
-            else f"HIGH：基礎 App 位階股數＋依成功送出賣單比例調整的 N 部分，N={n}。")
+            "集中度降水位：只保留原始 App 位階股數 1X，不啟動額外 N 倍。" if base_only
+            else ("LOW：App 位階股數×2，不扣既有庫存。" if plan.get("mode") == "LOW"
+            else f"HIGH：基礎 App 位階股數＋依成功送出賣單比例調整的 N 部分，N={n}。"))
         for leg in legs:
             if leg["estimated_amount"] <= available_cash:
                 buys.append(leg)
@@ -407,9 +555,11 @@ def build_strategy_plan(ark_snapshot, portfolio, live_quotes, *, spiral=None, no
     waterline = holding_value / total_asset * 100 if total_asset else 0.0
     mode = "LOW" if waterline <= LOW_WATERLINE_PCT else "HIGH"
     x_amount = sum(
-        _num(row.get("nav"), f"{symbol} NAV") * int(_num(row.get("app_shares"), f"{symbol} App 位階股數"))
+        _num(row.get("nav"), f"{symbol} NAV") * int(_num(row.get("app_shares", 0) or 0, f"{symbol} App 位階股數"))
         for symbol, row in eligible_rows.items()
     )
+
+    reduction = waterline_reduction_engine(ark_snapshot, holdings, holding_value, eligible_rows)
 
     if spiral == "midday":
         generated_at = now
@@ -423,6 +573,29 @@ def build_strategy_plan(ark_snapshot, portfolio, live_quotes, *, spiral=None, no
             "holdings": holdings,
             "spiral_plan": _build_spiral_plan(ark_snapshot, holdings, [], eligible_rows, quotes),
             "funding_source": "12:00 僅檢查既有庫存的雙股螺旋；不執行正常 LOW/HIGH 調節。",
+        }
+
+    if reduction["type"] == "APP_RISK_REDUCTION":
+        generated_at = now
+        valid_until = _valid_until(generated_at)
+        selected = reduction["planned_sells"]
+        return {
+            "preview_only": True, "snapshot_id": ark_snapshot.get("snapshot_id"),
+            "account": ark_snapshot.get("account"), "mode": mode,
+            "strategy_generated_at": generated_at.isoformat(),
+            "valid_until": valid_until.isoformat(),
+            "actual_waterline_pct": round(waterline, 6), "x_amount": round(x_amount, 2),
+            "expected_sell_capacity": round(reduction["planned_sell_amount"], 2),
+            "rotation_capacity": 0.0, "rotation_multiplier": 0, "target_multiplier": 0,
+            "rotation_target_amount": 0.0, "rotation_remaining_amount": 0.0,
+            "funding_source": "App 明確要求降低持股水位；不執行正常布局或 N 倍加碼。",
+            "planned_sell_amount": round(reduction["planned_sell_amount"], 2),
+            "planned_buy_amount": 0.0,
+            "planned_sells": selected, "planned_buys": [], "buy_targets": [],
+            "trade_plan": selected, "spiral_plan": None, "orders": [],
+            "holdings": holdings, "rotation_candidates": [],
+            "waterline_reduction": reduction,
+            "suppress_buys": True, "base_only_buys": False,
         }
 
     mandatory, candidates, low_loss_candidates, explanations = [], [], [], []
@@ -491,6 +664,8 @@ def build_strategy_plan(ark_snapshot, portfolio, live_quotes, *, spiral=None, no
         available_legs.extend(leg for leg in candidate["legs"] if not leg["nav_protected"])
     capacity = sum(leg["estimated_amount"] for leg in available_legs)
     n = min(MAX_ROTATION_MULTIPLIER, floor(capacity / x_amount)) if mode == "HIGH" and x_amount else 0
+    if reduction["type"] == "CONCENTRATION_REDUCTION":
+        n = 0
     target_sell = n * x_amount
     # 必賣先完整保留；P1~P4 的最後一檔才依缺口縮小。
     selected = mandatory[:]
@@ -518,6 +693,29 @@ def build_strategy_plan(ark_snapshot, portfolio, live_quotes, *, spiral=None, no
         if leg not in selected:
             selected.append(leg)
             selected_amount += leg["estimated_amount"]
+    if reduction["type"] == "CONCENTRATION_REDUCTION":
+        already = {}
+        for leg in selected:
+            already[leg["symbol"]] = already.get(leg["symbol"], 0) + leg["quantity"]
+        for leg in reduction["planned_sells"]:
+            remaining_qty = next(item["qty"] for item in holdings if item["symbol"] == leg["symbol"]) - already.get(leg["symbol"], 0)
+            if remaining_qty <= 0:
+                continue
+            qty = min(leg["quantity"], remaining_qty)
+            if qty != leg["quantity"]:
+                item = next(item for item in holdings if item["symbol"] == leg["symbol"])
+                replacement_legs = _sell_legs(item["symbol"], qty, item["quote"], item["nav"])
+                for replacement in replacement_legs:
+                    replacement["reason_code"] = leg["reason_code"]
+                    replacement["reason"] = leg["reason"]
+                for replacement in replacement_legs:
+                    selected.append(replacement)
+                    selected_amount += replacement["estimated_amount"]
+                already[leg["symbol"]] = already.get(leg["symbol"], 0) + qty
+            else:
+                selected.append(leg)
+                selected_amount += leg["estimated_amount"]
+                already[leg["symbol"]] = already.get(leg["symbol"], 0) + leg["quantity"]
     for leg in selected:
         if leg in mandatory:
             leg["reason_code"] = "WARM_MANDATORY"
@@ -525,6 +723,8 @@ def build_strategy_plan(ark_snapshot, portfolio, live_quotes, *, spiral=None, no
         elif leg in low_loss_offset_legs:
             leg["reason_code"] = "LOW_LOSS_OFFSET"
             leg["reason"] = next(text for text in explanations if text.startswith(leg["symbol"] + "："))
+        elif leg.get("reason_code") in {"CONCENTRATION_PROFIT_REDUCTION", "CONCENTRATION_WEAK_REDUCTION"}:
+            pass
         else:
             match = next(candidate for candidate in candidates if candidate["item"]["symbol"] == leg["symbol"])
             leg["reason_code"] = match["priority"]
@@ -532,11 +732,11 @@ def build_strategy_plan(ark_snapshot, portfolio, live_quotes, *, spiral=None, no
 
     spiral_plan = _build_spiral_plan(ark_snapshot, holdings, selected, eligible_rows, quotes)
 
-    multiplier = 2 if mode == "LOW" else 1 + n
+    multiplier = 1 if reduction["type"] == "CONCENTRATION_REDUCTION" else (2 if mode == "LOW" else 1 + n)
     buy_targets = []
     for symbol, row in eligible_rows.items():
         nav = _num(row.get("nav"), f"{symbol} NAV")
-        shares = int(_num(row.get("app_shares"), f"{symbol} App 位階股數"))
+        shares = int(_num(row.get("app_shares", 0) or 0, f"{symbol} App 位階股數"))
         quote = quotes.get(symbol)
         if not quote:
             raise ValueError(f"富邦缺少 {symbol} 即時報價")
@@ -558,6 +758,9 @@ def build_strategy_plan(ark_snapshot, portfolio, live_quotes, *, spiral=None, no
         "planned_sell_amount": round(sum(leg["estimated_amount"] for leg in selected), 2),
         "planned_buy_amount": round(sum(row["nav"] * row["app_shares"] * multiplier for row in buy_targets), 2),
         "planned_sells": selected, "planned_buys": [], "buy_targets": buy_targets,
+        "waterline_reduction": reduction,
+        "suppress_buys": False,
+        "base_only_buys": reduction["type"] == "CONCENTRATION_REDUCTION",
         "trade_plan": selected,
         "spiral_plan": spiral_plan,
         "orders": [],
