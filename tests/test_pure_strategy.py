@@ -874,6 +874,69 @@ class PureStrategyTests(unittest.TestCase):
         self.assertTrue(weak)
         self.assertEqual(weak[0]["symbol"], "1111")
 
+    def test_app_risk_reduction_targets_market_value_not_loss_amount(self):
+        data = snapshot(eligible=("0050",), shares=10)
+        data["risk_control"] = {
+            "risk_reduction_required": True,
+            "app_recommended_holding_amount": 76_880,
+        }
+        plan = build_strategy_plan(data, portfolio(0, {
+            "1111": {"qty": 240, "avg_cost": 108.3333333333},
+            "2222": {"qty": 760, "avg_cost": 90},
+        }), {
+            "0050": quote(),
+            "1111": quote(price=100, board_bid=100, odd_bid=100),
+            "2222": quote(price=100, board_bid=100, odd_bid=100),
+        })
+        # 目前持股市值 100,000 - 建議持股 76,880 = 23,120，向上取整為 24,000。
+        self.assertEqual(plan["waterline_reduction"]["target_amount"], 24_000)
+        self.assertEqual(plan["planned_sells"][0]["symbol"], "1111")
+        self.assertEqual(sum(x["estimated_amount"] for x in plan["planned_sells"]), 24_000)
+        # 該筆只實現約 -2,000 損失；是否達標看的是賣出市值 24,000，不是虧損金額。
+        self.assertAlmostEqual(
+            sum(
+                (x["limit_price"] - 108.3333333333) * x["quantity"]
+                for x in plan["planned_sells"]
+            ),
+            -2_000,
+            delta=1,
+        )
+
+    def test_concentration_all_positive_discounted_uses_single_highest_profit_fallback(self):
+        rows = [
+            {"symbol": "0050", "nav": 100, "app_shares": 10},
+            {"symbol": "006208", "nav": 100, "app_shares": 0},
+            {"symbol": "00875", "nav": 100, "app_shares": 0},
+            {"symbol": "00960", "nav": 100, "app_shares": 0},
+        ]
+        data = {
+            "snapshot_id": "discounted-positive-fallback",
+            "account": "fixture@example.invalid",
+            "eligible_value_zone": {"stocks": rows},
+            "raw_value_zone": {"stocks": rows},
+            "warming_zone": {"cross_table": []},
+        }
+        plan = build_strategy_plan(data, portfolio(0, {
+            "1111": {"qty": 100, "avg_cost": 90},   # +900, 但折價
+            "2222": {"qty": 100, "avg_cost": 80},   # +1900, 最高，且折價
+            "3333": {"qty": 100, "avg_cost": 95},   # +400, 折價
+            "4444": {"qty": 100, "avg_cost": 120},  # 弱勢，供 cover 測試
+        }), {
+            "0050": quote(), "006208": quote(), "00875": quote(), "00960": quote(),
+            "1111": quote(price=99, board_bid=99, odd_bid=99),
+            "2222": quote(price=99, board_bid=99, odd_bid=99),
+            "3333": quote(price=99, board_bid=99, odd_bid=99),
+            "4444": quote(price=100, board_bid=100, odd_bid=100),
+        })
+        reduction = plan["waterline_reduction"]
+        fallback = [
+            leg for leg in reduction["planned_sells"]
+            if leg["reason_code"] == "CONCENTRATION_PROFIT_FALLBACK"
+        ]
+        self.assertTrue(fallback)
+        self.assertEqual({leg["symbol"] for leg in fallback}, {"2222"})
+        self.assertGreaterEqual(reduction["realized_pnl"], -0.01)
+
     def test_spiral_uses_positive_return_highest_premium_seller_and_app_quantity(self):
         data = snapshot(eligible=("0050", "006208"), shares=10)
         data["app_adjustments"] = {"stocks": [
