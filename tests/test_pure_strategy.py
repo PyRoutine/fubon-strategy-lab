@@ -1051,6 +1051,125 @@ class PureStrategyTests(unittest.TestCase):
         self.assertEqual({leg["symbol"] for leg in profit}, {"P"})
         self.assertEqual({leg["symbol"] for leg in weak}, {"L1"})
 
+    def test_100_extreme_weird_inventory_concentration_cases(self):
+        rng = random.Random(202609231647)
+        rows = [
+            {"symbol": "0050", "nav": 100, "app_shares": 10},
+            {"symbol": "006208", "nav": 100, "app_shares": 0},
+            {"symbol": "00875", "nav": 100, "app_shares": 0},
+            {"symbol": "00960", "nav": 100, "app_shares": 0},
+            {"symbol": "00911", "nav": 100, "app_shares": 0},
+            {"symbol": "0056", "nav": 100, "app_shares": 0},
+        ]
+        qty_choices = [1, 7, 99, 500, 998, 999, 1000, 1001, 1999, 2000, 5000]
+        pnl_targets = [
+            -150000, -80000, -50000, -30000, -20000, -10000, -5000,
+            -2000, -1000, -500, -100, -20,
+            20, 100, 500, 1000, 2500, 5000, 10000, 30000, 80000, 150000,
+        ]
+
+        for case in range(100):
+            data = {
+                "snapshot_id": f"extreme-weird-{case}",
+                "account": "fixture@example.invalid",
+                "eligible_value_zone": {"stocks": rows},
+                "raw_value_zone": {"stocks": rows},
+                "warming_zone": {"cross_table": []},
+                "holdings": [],
+            }
+            holdings = {}
+            quotes = {
+                "0050": quote(), "006208": quote(), "00875": quote(),
+                "00960": quote(), "00911": quote(), "0056": quote(),
+            }
+
+            symbols = [f"W{case:03d}{i}" for i in range(rng.randint(4, 9))]
+            positive_symbols = []
+            negative_symbols = []
+            for symbol in symbols:
+                qty = rng.choice(qty_choices)
+                target_pnl = rng.choice(pnl_targets)
+                bid = rng.choice([80.0, 90.0, 95.0, 99.0, 100.0, 101.0, 105.0, 110.0, 120.0])
+                # 直接反推 avg_cost，讓「未實現報酬金額」跨極大範圍。
+                avg_cost = bid - (target_pnl / qty)
+                if avg_cost <= 0:
+                    avg_cost = max(0.01, bid * 0.05)
+                    target_pnl = (bid - avg_cost) * qty
+
+                # NAV 故意在 bid 上下，讓有些正報酬是溢價、有些是折價。
+                nav = bid * rng.choice([0.97, 0.99, 1.00, 1.01, 1.03])
+                odd_bid = bid * rng.choice([0.995, 1.0, 1.005])
+                board_ask = bid * rng.choice([0.995, 1.0, 1.005, 1.01])
+                odd_ask = board_ask * rng.choice([0.995, 1.0, 1.005])
+
+                holdings[symbol] = {"qty": qty, "avg_cost": avg_cost}
+                quotes[symbol] = quote(
+                    price=bid,
+                    board_bid=bid,
+                    odd_bid=odd_bid,
+                    board_ask=board_ask,
+                    odd_ask=odd_ask,
+                )
+                data["holdings"].append({"symbol": symbol, "nav": nav})
+                realized_est = (max(bid, odd_bid) - avg_cost) * qty
+                if realized_est > 0:
+                    positive_symbols.append(symbol)
+                elif realized_est < 0:
+                    negative_symbols.append(symbol)
+
+            if not positive_symbols or not negative_symbols:
+                # 強制至少一正一負，避免這組無法測集中度降水位配對。
+                p, n = symbols[0], symbols[1]
+                p_qty = holdings[p]["qty"]
+                n_qty = holdings[n]["qty"]
+                p_bid = 100.0
+                n_bid = 100.0
+                holdings[p]["avg_cost"] = max(0.01, p_bid - 10000 / p_qty)
+                holdings[n]["avg_cost"] = n_bid + 20000 / n_qty
+                quotes[p] = quote(price=p_bid, board_bid=p_bid, odd_bid=p_bid, board_ask=101, odd_ask=101)
+                quotes[n] = quote(price=n_bid, board_bid=n_bid, odd_bid=n_bid, board_ask=101, odd_ask=101)
+                for row in data["holdings"]:
+                    if row["symbol"] == p:
+                        row["nav"] = 99.0
+                    elif row["symbol"] == n:
+                        row["nav"] = 100.0
+
+            plan = build_strategy_plan(data, portfolio(0, holdings), quotes)
+            reduction = plan["waterline_reduction"]
+            self.assertEqual(reduction["type"], "CONCENTRATION_REDUCTION")
+            self.assertEqual(plan["rotation_multiplier"], 0)
+            self.assertTrue(plan["base_only_buys"])
+
+            sold_by_symbol = {}
+            for leg in reduction["planned_sells"]:
+                sold_by_symbol[leg["symbol"]] = sold_by_symbol.get(leg["symbol"], 0) + leg["quantity"]
+                self.assertGreater(leg["quantity"], 0)
+                self.assertIn(leg["market"], ("整股", "零股"))
+            for symbol, sold_qty in sold_by_symbol.items():
+                self.assertLessEqual(sold_qty, holdings[symbol]["qty"])
+
+            # 正報酬來源最多只能有 1 檔。
+            profit_symbols = {
+                leg["symbol"] for leg in reduction["planned_sells"]
+                if leg["reason_code"] in {
+                    "CONCENTRATION_PROFIT_REDUCTION",
+                    "CONCENTRATION_PROFIT_FALLBACK",
+                }
+            }
+            self.assertLessEqual(len(profit_symbols), 1)
+
+            # 只要存在虧損庫存，最差虧損那一檔一定被處理。
+            holding_rows = {row["symbol"]: row for row in plan["holdings"]}
+            loss_rows = [row for row in plan["holdings"] if row["unrealized_pnl"] < 0]
+            if loss_rows:
+                worst = min(loss_rows, key=lambda row: (row["unrealized_pnl"], row["symbol"]))
+                self.assertIn(worst["symbol"], sold_by_symbol)
+
+            # 買進只保留 App 原始 1X；不會因賣出金額重新開 N 倍。
+            buys = build_affordable_buys(plan, 500_000, reduction["planned_sell_amount"])
+            expected_base = sum(int(row["app_shares"]) for row in rows)
+            self.assertEqual(sum(leg["quantity"] for leg in buys), expected_base)
+
     def test_spiral_uses_positive_return_highest_premium_seller_and_app_quantity(self):
         data = snapshot(eligible=("0050", "006208"), shares=10)
         data["app_adjustments"] = {"stocks": [
