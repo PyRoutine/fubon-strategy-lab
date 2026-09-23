@@ -326,12 +326,27 @@ def _build_spiral_plan(snapshot, holdings, selected_sells, eligible_rows=None, l
     if seller_premium - buyer_premium <= 0.5:
         return None
     expected_amount = sum(leg["estimated_amount"] for leg in sell_legs)
+    buyer_qty = floor(expected_amount / buyer["nav"])
+    buyer_legs = _buy_legs(
+        buyer["symbol"], buyer_qty, buyer["quote"], buyer["nav"],
+        "雙股螺旋：使用賣方可投入金額轉入折溢價較低的有效價值區標的。",
+    )
+    if sum(leg["quantity"] for leg in buyer_legs) != buyer_qty:
+        return None
+
+    for leg in sell_legs:
+        leg["reason_code"] = "SPIRAL_SELL"
+        leg["reason"] = "雙股螺旋：依 App 建議調節股數賣出正報酬庫存。"
+    for leg in buyer_legs:
+        leg["reason_code"] = "SPIRAL_BUY"
+
     return {
         "status": "PLANNED", "seller_symbol": seller["symbol"], "buyer_symbol": buyer["symbol"],
         "seller_premium_pct": round(seller_premium, 6), "buyer_premium_pct": round(buyer_premium, 6),
         "premium_gap_pct": round(seller_premium - buyer_premium, 6),
         "seller_planned_qty": sell_qty, "seller_legs": sell_legs,
-        "buyer_nav": buyer["nav"], "buyer_max_qty": floor(expected_amount / buyer["nav"]),
+        "seller_expected_amount": round(expected_amount, 2),
+        "buyer_nav": buyer["nav"], "buyer_max_qty": buyer_qty, "buyer_legs": buyer_legs,
         "reason": "雙股螺旋：正報酬賣方折溢價最高、買方折溢價最低，差距超過 0.5 個百分點。",
     }
 
