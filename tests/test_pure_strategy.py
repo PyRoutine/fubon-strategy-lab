@@ -937,6 +937,98 @@ class PureStrategyTests(unittest.TestCase):
         self.assertEqual({leg["symbol"] for leg in fallback}, {"2222"})
         self.assertGreaterEqual(reduction["realized_pnl"], -0.01)
 
+    def test_concentration_reduction_clears_all_losses_when_one_profit_covers_them(self):
+        rows = [
+            {"symbol": "0050", "nav": 100, "app_shares": 10},
+            {"symbol": "006208", "nav": 100, "app_shares": 0},
+            {"symbol": "00875", "nav": 100, "app_shares": 0},
+            {"symbol": "00960", "nav": 100, "app_shares": 0},
+        ]
+        data = {
+            "snapshot_id": "cover-all-losses",
+            "account": "fixture@example.invalid",
+            "eligible_value_zone": {"stocks": rows},
+            "raw_value_zone": {"stocks": rows},
+            "warming_zone": {"cross_table": []},
+        }
+        plan = build_strategy_plan(data, portfolio(0, {
+            "P": {"qty": 100, "avg_cost": 0},      # +10,000
+            "L1": {"qty": 100, "avg_cost": 120},  # -2,000
+            "L2": {"qty": 100, "avg_cost": 110},  # -1,000
+            "L3": {"qty": 100, "avg_cost": 105},  # -500
+        }), {
+            "0050": quote(), "006208": quote(), "00875": quote(), "00960": quote(),
+            "P": quote(price=100, board_bid=100, odd_bid=100),
+            "L1": quote(price=100, board_bid=100, odd_bid=100),
+            "L2": quote(price=100, board_bid=100, odd_bid=100),
+            "L3": quote(price=100, board_bid=100, odd_bid=100),
+        })
+        sold = {leg["symbol"] for leg in plan["waterline_reduction"]["planned_sells"]}
+        self.assertEqual(sold, {"P", "L1", "L2", "L3"})
+
+    def test_concentration_reduction_only_worst_loss_when_profit_cannot_cover_it(self):
+        rows = [
+            {"symbol": "0050", "nav": 100, "app_shares": 10},
+            {"symbol": "006208", "nav": 100, "app_shares": 0},
+            {"symbol": "00875", "nav": 100, "app_shares": 0},
+            {"symbol": "00960", "nav": 100, "app_shares": 0},
+        ]
+        data = {
+            "snapshot_id": "worst-loss-plus-profit",
+            "account": "fixture@example.invalid",
+            "eligible_value_zone": {"stocks": rows},
+            "raw_value_zone": {"stocks": rows},
+            "warming_zone": {"cross_table": []},
+        }
+        plan = build_strategy_plan(data, portfolio(0, {
+            "P": {"qty": 50, "avg_cost": 0},        # +5,000
+            "L1": {"qty": 100, "avg_cost": 300},   # -20,000
+            "L2": {"qty": 100, "avg_cost": 200},   # -10,000
+            "L3": {"qty": 100, "avg_cost": 150},   # -5,000
+        }), {
+            "0050": quote(), "006208": quote(), "00875": quote(), "00960": quote(),
+            "P": quote(price=100, board_bid=100, odd_bid=100),
+            "L1": quote(price=100, board_bid=100, odd_bid=100),
+            "L2": quote(price=100, board_bid=100, odd_bid=100),
+            "L3": quote(price=100, board_bid=100, odd_bid=100),
+        })
+        sold = {leg["symbol"] for leg in plan["waterline_reduction"]["planned_sells"]}
+        self.assertEqual(sold, {"P", "L1"})
+
+    def test_concentration_reduction_all_positive_discounted_still_uses_best_profit_one(self):
+        rows = [
+            {"symbol": "0050", "nav": 100, "app_shares": 10},
+            {"symbol": "006208", "nav": 100, "app_shares": 0},
+            {"symbol": "00875", "nav": 100, "app_shares": 0},
+            {"symbol": "00960", "nav": 100, "app_shares": 0},
+        ]
+        data = {
+            "snapshot_id": "discounted-best-profit",
+            "account": "fixture@example.invalid",
+            "eligible_value_zone": {"stocks": rows},
+            "raw_value_zone": {"stocks": rows},
+            "warming_zone": {"cross_table": []},
+        }
+        plan = build_strategy_plan(data, portfolio(0, {
+            "P": {"qty": 50, "avg_cost": 0},        # +4,950 at bid 99, all discounted
+            "Q": {"qty": 50, "avg_cost": 50},       # +2,450
+            "L1": {"qty": 100, "avg_cost": 300},    # -20,000
+            "L2": {"qty": 100, "avg_cost": 200},    # -10,000
+            "L3": {"qty": 100, "avg_cost": 150},    # -5,000
+        }), {
+            "0050": quote(), "006208": quote(), "00875": quote(), "00960": quote(),
+            "P": quote(price=99, board_bid=99, odd_bid=99),
+            "Q": quote(price=99, board_bid=99, odd_bid=99),
+            "L1": quote(price=100, board_bid=100, odd_bid=100),
+            "L2": quote(price=100, board_bid=100, odd_bid=100),
+            "L3": quote(price=100, board_bid=100, odd_bid=100),
+        })
+        reduction = plan["waterline_reduction"]
+        profit = [leg for leg in reduction["planned_sells"] if leg["reason_code"] == "CONCENTRATION_PROFIT_FALLBACK"]
+        weak = [leg for leg in reduction["planned_sells"] if leg["reason_code"] == "CONCENTRATION_WEAK_REDUCTION"]
+        self.assertEqual({leg["symbol"] for leg in profit}, {"P"})
+        self.assertEqual({leg["symbol"] for leg in weak}, {"L1"})
+
     def test_spiral_uses_positive_return_highest_premium_seller_and_app_quantity(self):
         data = snapshot(eligible=("0050", "006208"), shares=10)
         data["app_adjustments"] = {"stocks": [
