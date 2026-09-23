@@ -723,15 +723,16 @@ class PureStrategyTests(unittest.TestCase):
         self.assertEqual(spiral["buyer_symbol"], "00875")
 
     def test_stress_high_buy_scale_at_one_forty_nine_ninety_nine_percent(self):
+        base_one_x_cash = 10_000
         plan = build_strategy_plan(
             snapshot(shares=100),
-            portfolio(0, {"9999": {"qty": 10000, "avg_cost": 80}}),
+            portfolio(base_one_x_cash, {"9999": {"qty": 10000, "avg_cost": 80}}),
             {"0050": quote(), "9999": quote()},
         )
         target = plan["rotation_target_amount"]
         for ratio in (0.01, 0.49, 0.99):
             with self.subTest(ratio=ratio):
-                buys = build_affordable_buys(plan, 0, target * ratio)
+                buys = build_affordable_buys(plan, base_one_x_cash, target * ratio)
                 expected = 100 + int(100 * plan["rotation_multiplier"] * ratio)
                 self.assertEqual(sum(x["quantity"] for x in buys), expected)
 
