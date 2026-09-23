@@ -273,8 +273,9 @@ def waterline_reduction_engine(snapshot, holdings, holding_value, eligible_rows)
     profit_legs = []
     realized_profit = 0.0
     profit_symbols = set()
-    for item in holdings:
-        if item["return_pct"] <= 0 or not item["nav"]:
+    positive_items = [item for item in holdings if item["return_pct"] > 0]
+    for item in positive_items:
+        if not item["nav"]:
             continue
         legs = _sell_legs(item["symbol"], item["qty"], item["quote"], item["nav"])
         if not legs or any(leg["limit_price"] <= item["nav"] for leg in legs):
@@ -288,6 +289,19 @@ def waterline_reduction_engine(snapshot, holdings, holding_value, eligible_rows)
         profit_legs.extend(legs)
         realized_profit += pnl
         profit_symbols.add(item["symbol"])
+
+    # 若所有正報酬庫存都處於折價，仍需降水位：挑未實現報酬金額最高的 1 檔整檔賣出。
+    if not profit_legs and positive_items:
+        item = max(positive_items, key=lambda row: (row["unrealized_pnl"], row["symbol"]))
+        legs = _sell_legs(item["symbol"], item["qty"], item["quote"], item["nav"])
+        pnl = _realized_pnl_for_legs(item, legs)
+        if legs and pnl > 0:
+            for leg in legs:
+                leg["reason_code"] = "CONCENTRATION_PROFIT_FALLBACK"
+                leg["reason"] = "有效價值區可買檔數不足一半，且正報酬庫存皆折價：改賣未實現報酬金額最高的 1 檔。"
+            profit_legs.extend(legs)
+            realized_profit += pnl
+            profit_symbols.add(item["symbol"])
 
     weak_legs = []
     loss_budget = realized_profit
@@ -723,7 +737,7 @@ def build_strategy_plan(ark_snapshot, portfolio, live_quotes, *, spiral=None, no
         elif leg in low_loss_offset_legs:
             leg["reason_code"] = "LOW_LOSS_OFFSET"
             leg["reason"] = next(text for text in explanations if text.startswith(leg["symbol"] + "："))
-        elif leg.get("reason_code") in {"CONCENTRATION_PROFIT_REDUCTION", "CONCENTRATION_WEAK_REDUCTION"}:
+        elif leg.get("reason_code") in {"CONCENTRATION_PROFIT_REDUCTION", "CONCENTRATION_PROFIT_FALLBACK", "CONCENTRATION_WEAK_REDUCTION"}:
             pass
         else:
             match = next(candidate for candidate in candidates if candidate["item"]["symbol"] == leg["symbol"])
