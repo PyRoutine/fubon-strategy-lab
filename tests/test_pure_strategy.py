@@ -66,6 +66,20 @@ class PureStrategyTests(unittest.TestCase):
         self.assertEqual(offset["reason_code"], "LOW_LOSS_OFFSET")
         self.assertEqual(plan["rotation_multiplier"], 0)
 
+    def test_low_loss_offsets_at_most_two_and_worst_return_first(self):
+        data = snapshot(eligible=("0050",), warming=("0050",))
+        plan = build_strategy_plan(data, portfolio(100_000, {
+            "0050": {"qty": 1000, "avg_cost": 50},
+            "1111": {"qty": 100, "avg_cost": 120},
+            "2222": {"qty": 100, "avg_cost": 130},
+            "3333": {"qty": 100, "avg_cost": 140},
+        }), {
+            "0050": quote(), "1111": quote(), "2222": quote(), "3333": quote(),
+        })
+        offsets = [leg for leg in plan["planned_sells"] if leg.get("reason_code") == "LOW_LOSS_OFFSET"]
+        self.assertLessEqual(len({leg["symbol"] for leg in offsets}), 2)
+        self.assertEqual([leg["symbol"] for leg in offsets], ["3333", "2222"])
+
     def test_high_warming_loss_is_mandatory_not_ranked(self):
         plan = build_strategy_plan(snapshot(warming=("0050",)), portfolio(0, {"0050": {"qty": 1000, "avg_cost": 110}}), {"0050": quote()})
         self.assertEqual(plan["mode"], "HIGH")
