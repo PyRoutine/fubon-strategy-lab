@@ -269,8 +269,8 @@ def _valid_until(now):
     return min(now + PLAN_VALIDITY, cutoff)
 
 
-def _build_spiral_plan(snapshot, holdings, selected_sells):
-    """雙股螺旋只定案配對與賣方上限；成交後買量由追蹤器依實收金額換算。"""
+def _build_spiral_plan(snapshot, holdings, selected_sells, eligible_rows=None, live_quotes=None):
+    """雙股螺旋只定案配對與賣方上限；買方可為未持有的有效價值區標的。"""
     sold = {}
     for leg in selected_sells:
         sold[leg["symbol"]] = sold.get(leg["symbol"], 0) + leg["quantity"]
@@ -286,9 +286,6 @@ def _build_spiral_plan(snapshot, holdings, selected_sells):
         if not item["nav"]:
             continue
         remaining_qty = item["qty"] - sold.get(item["symbol"], 0)
-        ask_premium = _best_buy_ask(item["quote"], remaining_qty)
-        if ask_premium:
-            ask_premium = (ask_premium - item["nav"]) / item["nav"] * 100
         if item["return_pct"] > 0 and adjustments.get(item["symbol"]):
             sell_qty = min(remaining_qty, int(_num(adjustments[item["symbol"]], "App 建議調節股數")))
             sell_legs = _sell_legs(item["symbol"], sell_qty, item["quote"], item["nav"])
@@ -296,8 +293,26 @@ def _build_spiral_plan(snapshot, holdings, selected_sells):
                 sell_amount = sum(leg["estimated_amount"] for leg in sell_legs)
                 bid_premium = (sell_amount / sell_qty - item["nav"]) / item["nav"] * 100
                 sellers.append((bid_premium, item, sell_qty, sell_legs))
-        if item["is_eligible"] and ask_premium is not None:
-            buyers.append((ask_premium, item))
+
+    holding_by_symbol = {item["symbol"]: item for item in holdings}
+    for symbol, row in (eligible_rows or {}).items():
+        nav = _num(row.get("nav"), f"{symbol} NAV")
+        quote = (live_quotes or {}).get(symbol)
+        if not quote:
+            continue
+        held = holding_by_symbol.get(symbol)
+        qty_for_market = held["qty"] - sold.get(symbol, 0) if held else int(_num(row.get("app_shares", 1) or 1, f"{symbol} App 位階股數"))
+        qty_for_market = max(1, qty_for_market)
+        ask = _best_buy_ask(quote, qty_for_market)
+        if ask is None:
+            continue
+        ask_premium = (ask - nav) / nav * 100
+        buyers.append((ask_premium, {
+            "symbol": symbol,
+            "nav": nav,
+            "quote": quote,
+            "is_eligible": True,
+        }))
     if not sellers or len(buyers) < 2:
         return None
     # 同溢價時代號小者優先，避免每次重算任意換配對。
@@ -388,7 +403,7 @@ def build_strategy_plan(ark_snapshot, portfolio, live_quotes, *, spiral=None, no
             "actual_waterline_pct": round(waterline, 6), "x_amount": round(x_amount, 2),
             "rotation_multiplier": 0, "planned_sells": [], "planned_buys": [],
             "holdings": holdings,
-            "spiral_plan": _build_spiral_plan(ark_snapshot, holdings, []),
+            "spiral_plan": _build_spiral_plan(ark_snapshot, holdings, [], eligible_rows, quotes),
             "funding_source": "12:00 僅檢查既有庫存的雙股螺旋；不執行正常 LOW/HIGH 調節。",
         }
 
@@ -497,7 +512,7 @@ def build_strategy_plan(ark_snapshot, portfolio, live_quotes, *, spiral=None, no
             leg["reason_code"] = match["priority"]
             leg["reason"] = match["reason"]
 
-    spiral_plan = _build_spiral_plan(ark_snapshot, holdings, selected)
+    spiral_plan = _build_spiral_plan(ark_snapshot, holdings, selected, eligible_rows, quotes)
 
     multiplier = 2 if mode == "LOW" else 1 + n
     buy_targets = []
