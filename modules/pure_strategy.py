@@ -268,66 +268,60 @@ def waterline_reduction_engine(snapshot, holdings, holding_value, eligible_rows)
             "positive_app_share_count": positive_count, "eligible_count": len(eligible_rows),
         }
 
-    # 位階股數過度集中：正報酬且實際賣價高於 NAV 的庫存先全部獲利了結，
-    # 再以這些已實現獲利 cover 報酬金額最低的負報酬庫存；整體實現損益不得為負。
-    profit_legs = []
-    realized_profit = 0.0
-    profit_symbols = set()
+    # 位階股數過度集中：
+    # 只選 1 檔正報酬來源；有溢價時取「正報酬＋溢價」中未實現報酬金額最高，
+    # 若全部折價，則退回所有正報酬庫存中未實現報酬金額最高的 1 檔。
     positive_items = [item for item in holdings if item["return_pct"] > 0]
+    premium_positive = []
     for item in positive_items:
         if not item["nav"]:
             continue
         legs = _sell_legs(item["symbol"], item["qty"], item["quote"], item["nav"])
-        if not legs or any(leg["limit_price"] <= item["nav"] for leg in legs):
-            continue
-        pnl = _realized_pnl_for_legs(item, legs)
-        if pnl <= 0:
-            continue
-        for leg in legs:
-            leg["reason_code"] = "CONCENTRATION_PROFIT_REDUCTION"
-            leg["reason"] = "有效價值區可買檔數不足一半：正報酬且溢價庫存先獲利了結以降低水位。"
-        profit_legs.extend(legs)
-        realized_profit += pnl
-        profit_symbols.add(item["symbol"])
+        if legs and all(leg["limit_price"] > item["nav"] for leg in legs):
+            premium_positive.append(item)
 
-    # 若所有正報酬庫存都處於折價，仍需降水位：挑未實現報酬金額最高的 1 檔整檔賣出。
-    if not profit_legs and positive_items:
-        item = max(positive_items, key=lambda row: (row["unrealized_pnl"], row["symbol"]))
-        legs = _sell_legs(item["symbol"], item["qty"], item["quote"], item["nav"])
-        pnl = _realized_pnl_for_legs(item, legs)
+    profit_legs = []
+    realized_profit = 0.0
+    profit_symbols = set()
+    profit_item = None
+    if premium_positive:
+        profit_item = max(premium_positive, key=lambda row: (row["unrealized_pnl"], row["symbol"]))
+        profit_reason_code = "CONCENTRATION_PROFIT_REDUCTION"
+        profit_reason = "有效價值區可買檔數不足一半：賣出正報酬且溢價中未實現報酬金額最高的 1 檔。"
+    elif positive_items:
+        profit_item = max(positive_items, key=lambda row: (row["unrealized_pnl"], row["symbol"]))
+        profit_reason_code = "CONCENTRATION_PROFIT_FALLBACK"
+        profit_reason = "有效價值區可買檔數不足一半，且正報酬庫存皆折價：改賣未實現報酬金額最高的 1 檔。"
+
+    if profit_item:
+        legs = _sell_legs(profit_item["symbol"], profit_item["qty"], profit_item["quote"], profit_item["nav"])
+        pnl = _realized_pnl_for_legs(profit_item, legs)
         if legs and pnl > 0:
             for leg in legs:
-                leg["reason_code"] = "CONCENTRATION_PROFIT_FALLBACK"
-                leg["reason"] = "有效價值區可買檔數不足一半，且正報酬庫存皆折價：改賣未實現報酬金額最高的 1 檔。"
+                leg["reason_code"] = profit_reason_code
+                leg["reason"] = profit_reason
             profit_legs.extend(legs)
-            realized_profit += pnl
-            profit_symbols.add(item["symbol"])
+            realized_profit = pnl
+            profit_symbols.add(profit_item["symbol"])
 
+    # 虧損端從未實現虧損金額最大（最負）開始。
+    # 先至少處理最差虧損 1 檔；之後只有在「累積虧損 + 正報酬來源」仍 >= 0 時才繼續多處理下一檔。
     weak_legs = []
-    loss_budget = realized_profit
-    for item in sorted(holdings, key=lambda row: (row["unrealized_pnl"], row["symbol"])):
-        if item["symbol"] in profit_symbols or item["unrealized_pnl"] >= 0 or loss_budget <= 0:
-            continue
-        loss_per_share = max(0.0, -item["unrealized_pnl"] / item["qty"])
-        if loss_per_share <= 0:
-            continue
-        qty = min(item["qty"], int(loss_budget // loss_per_share))
-        if qty <= 0:
-            continue
-        legs = _sell_legs(item["symbol"], qty, item["quote"], item["nav"])
-        actual_loss = max(0.0, -_realized_pnl_for_legs(item, legs))
-        while legs and actual_loss > loss_budget + 1e-9:
-            qty -= 1
-            if qty <= 0:
-                legs = []
-                break
-            legs = _sell_legs(item["symbol"], qty, item["quote"], item["nav"])
-            actual_loss = max(0.0, -_realized_pnl_for_legs(item, legs))
-        for leg in legs:
+    cumulative_loss = 0.0
+    negative_items = sorted(
+        [item for item in holdings if item["unrealized_pnl"] < 0 and item["symbol"] not in profit_symbols],
+        key=lambda row: (row["unrealized_pnl"], row["symbol"]),
+    )
+    for index, item in enumerate(negative_items):
+        full_legs = _sell_legs(item["symbol"], item["qty"], item["quote"], item["nav"])
+        full_loss = max(0.0, -_realized_pnl_for_legs(item, full_legs))
+        if index > 0 and cumulative_loss + full_loss > realized_profit + 1e-9:
+            break
+        for leg in full_legs:
             leg["reason_code"] = "CONCENTRATION_WEAK_REDUCTION"
-            leg["reason"] = "有效價值區可買檔數不足一半：以溢價獲利庫存的已實現獲利 cover 弱勢庫存，總實現損益不得為負。"
-        weak_legs.extend(legs)
-        loss_budget -= actual_loss
+            leg["reason"] = "有效價值區可買檔數不足一半：從未實現虧損金額最大開始清理；正報酬來源足夠時再往下一檔。"
+        weak_legs.extend(full_legs)
+        cumulative_loss += full_loss
 
     selected = profit_legs + weak_legs
     realized_total = realized_profit + sum(
