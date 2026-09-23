@@ -604,6 +604,160 @@ class PureStrategyTests(unittest.TestCase):
                     spiral["buyer_max_qty"],
                 )
 
+    def test_stress_weird_inventory_many_priority_buckets(self):
+        data = snapshot(eligible=("0050", "006208", "00875"), shares=20)
+        plan = build_strategy_plan(data, portfolio(0, {
+            "1111": {"qty": 999, "avg_cost": 150},
+            "2222": {"qty": 1001, "avg_cost": 108},
+            "3333": {"qty": 1999, "avg_cost": 80},
+            "0050": {"qty": 2001, "avg_cost": 90},
+            "006208": {"qty": 1, "avg_cost": 80},
+            "00875": {"qty": 1000, "avg_cost": 95},
+        }), {
+            "1111": quote(board_bid=100, odd_bid=99),
+            "2222": quote(board_bid=100, odd_bid=101),
+            "3333": quote(board_bid=100, odd_bid=100),
+            "0050": quote(board_bid=101, odd_bid=100.5),
+            "006208": quote(board_bid=102, odd_bid=102),
+            "00875": quote(board_bid=99, odd_bid=101),
+        })
+        priorities = [row["priority"] for row in plan["rotation_candidates"]]
+        self.assertEqual(priorities, sorted(priorities, key=lambda p: int(p[1])))
+        sold = {}
+        for leg in plan["planned_sells"]:
+            sold[leg["symbol"]] = sold.get(leg["symbol"], 0) + leg["quantity"]
+        for symbol, qty in sold.items():
+            self.assertLessEqual(qty, plan["holdings"][[x["symbol"] for x in plan["holdings"]].index(symbol)]["qty"])
+
+    def test_stress_p4_mostly_nav_blocked(self):
+        data = snapshot(eligible=("0050", "006208", "00875"), shares=50)
+        plan = build_strategy_plan(data, portfolio(0, {
+            "0050": {"qty": 1500, "avg_cost": 90},
+            "006208": {"qty": 1500, "avg_cost": 90},
+            "00875": {"qty": 1500, "avg_cost": 90},
+        }), {
+            "0050": quote(board_bid=99, odd_bid=99),
+            "006208": quote(board_bid=101, odd_bid=99),
+            "00875": quote(board_bid=99, odd_bid=101),
+        })
+        self.assertTrue(all(
+            leg["limit_price"] >= 100
+            for leg in plan["planned_sells"]
+            if leg.get("reason_code") == "P4"
+        ))
+
+    def test_stress_only_one_buyable_symbol_has_nonzero_app_shares(self):
+        rows = [
+            {"symbol": "0050", "nav": 100, "app_shares": 0},
+            {"symbol": "006208", "nav": 100, "app_shares": 0},
+            {"symbol": "00875", "nav": 100, "app_shares": 7},
+        ]
+        data = {
+            "snapshot_id": "weird-one-buy",
+            "account": "fixture@example.invalid",
+            "eligible_value_zone": {"stocks": rows},
+            "raw_value_zone": {"stocks": rows},
+            "warming_zone": {"cross_table": []},
+        }
+        plan = build_strategy_plan(data, portfolio(100_000, {}), {
+            "0050": quote(), "006208": quote(), "00875": quote(),
+        })
+        buys = build_affordable_buys(plan, 100_000)
+        self.assertEqual({leg["symbol"] for leg in buys}, {"00875"})
+
+    def test_stress_share_boundaries_across_many_holdings(self):
+        quantities = [1, 998, 999, 1000, 1001, 1999, 2000, 2001]
+        holdings = {}
+        quotes = {"0050": quote()}
+        for idx, qty in enumerate(quantities):
+            symbol = f"W{idx:03d}"
+            holdings[symbol] = {"qty": qty, "avg_cost": 90}
+            quotes[symbol] = quote(board_bid=100 + (idx % 2), odd_bid=101 - (idx % 2))
+        plan = build_strategy_plan(snapshot(shares=10), portfolio(0, holdings), quotes)
+        sold = {}
+        for leg in plan["planned_sells"]:
+            sold[leg["symbol"]] = sold.get(leg["symbol"], 0) + leg["quantity"]
+            self.assertTrue(leg["market"] in ("整股", "零股"))
+        for symbol, qty in sold.items():
+            self.assertLessEqual(qty, holdings[symbol]["qty"])
+
+    def test_stress_warming_sale_exceeds_rotation_target_by_large_margin(self):
+        data = snapshot(eligible=("0050",), shares=1, warming=("0050",))
+        plan = build_strategy_plan(data, portfolio(0, {
+            "0050": {"qty": 5000, "avg_cost": 50},
+        }), {"0050": quote()})
+        self.assertEqual(plan["rotation_multiplier"], 5)
+        self.assertGreater(plan["planned_sell_amount"], plan["rotation_target_amount"] * 100)
+
+    def test_stress_spiral_seller_left_with_one_share(self):
+        data = snapshot(eligible=("0050", "006208"), shares=10)
+        data["app_adjustments"] = {"stocks": [{"symbol": "0050", "app_reduce_min_shares": 1}]}
+        plan = build_strategy_plan(data, portfolio(100_000, {
+            "0050": {"qty": 1, "avg_cost": 80},
+        }), {
+            "0050": quote(board_bid=102, odd_bid=102, board_ask=103, odd_ask=103),
+            "006208": quote(board_bid=99, odd_bid=99, board_ask=99, odd_ask=99),
+        })
+        spiral = plan["spiral_plan"]
+        if spiral:
+            self.assertEqual(spiral["seller_planned_qty"], 1)
+            self.assertEqual(sum(x["quantity"] for x in spiral["seller_legs"]), 1)
+
+    def test_stress_spiral_multiple_sellers_multiple_unheld_buyers(self):
+        data = snapshot(eligible=("0050", "006208", "00875"), shares=10)
+        data["app_adjustments"] = {"stocks": [
+            {"symbol": "0050", "app_reduce_min_shares": 30},
+            {"symbol": "006208", "app_reduce_min_shares": 30},
+        ]}
+        plan = build_strategy_plan(data, portfolio(100_000, {
+            "0050": {"qty": 100, "avg_cost": 80},
+            "006208": {"qty": 100, "avg_cost": 80},
+        }), {
+            "0050": quote(board_bid=103, odd_bid=103, board_ask=104, odd_ask=104),
+            "006208": quote(board_bid=102, odd_bid=102, board_ask=103, odd_ask=103),
+            "00875": quote(board_bid=98, odd_bid=98, board_ask=98, odd_ask=98),
+        })
+        spiral = plan["spiral_plan"]
+        self.assertIsNotNone(spiral)
+        self.assertEqual(spiral["seller_symbol"], "0050")
+        self.assertEqual(spiral["buyer_symbol"], "00875")
+
+    def test_stress_high_buy_scale_at_one_forty_nine_ninety_nine_percent(self):
+        plan = build_strategy_plan(
+            snapshot(shares=100),
+            portfolio(0, {"9999": {"qty": 10000, "avg_cost": 80}}),
+            {"0050": quote(), "9999": quote()},
+        )
+        target = plan["rotation_target_amount"]
+        for ratio in (0.01, 0.49, 0.99):
+            with self.subTest(ratio=ratio):
+                buys = build_affordable_buys(plan, 0, target * ratio)
+                expected = 100 + int(100 * plan["rotation_multiplier"] * ratio)
+                self.assertEqual(sum(x["quantity"] for x in buys), expected)
+
+    def test_stress_cash_tiny_relative_to_nav(self):
+        plan = build_strategy_plan(
+            snapshot(eligible=("0050", "006208"), shares=100),
+            portfolio(1, {}),
+            {"0050": quote(), "006208": quote()},
+        )
+        self.assertEqual(build_affordable_buys(plan, 1), [])
+
+    def test_stress_huge_cost_dispersion_and_mixed_markets(self):
+        data = snapshot(eligible=("0050", "006208"), shares=30)
+        plan = build_strategy_plan(data, portfolio(0, {
+            "0050": {"qty": 2500, "avg_cost": 1},
+            "006208": {"qty": 2500, "avg_cost": 1000},
+            "9999": {"qty": 2500, "avg_cost": 500},
+        }), {
+            "0050": quote(board_bid=101, odd_bid=102),
+            "006208": quote(board_bid=99, odd_bid=98),
+            "9999": quote(board_bid=100, odd_bid=101),
+        })
+        for leg in plan["planned_sells"]:
+            self.assertGreater(leg["quantity"], 0)
+            self.assertGreater(leg["limit_price"], 0)
+
     def test_spiral_uses_positive_return_highest_premium_seller_and_app_quantity(self):
         data = snapshot(eligible=("0050", "006208"), shares=10)
         data["app_adjustments"] = {"stocks": [
