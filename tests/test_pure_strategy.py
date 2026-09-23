@@ -1170,6 +1170,175 @@ class PureStrategyTests(unittest.TestCase):
             expected_base = sum(int(row["app_shares"]) for row in rows)
             self.assertEqual(sum(leg["quantity"] for leg in buys), expected_base)
 
+    def test_real_ark_portfolio_scaled_variants(self):
+        """兩次真實 ARK 結構去識別化後，做 80 組資產規模/成本偏移 shadow cases。"""
+        baselines = [
+            {
+                "eligible": [
+                    ("0053", 254.15, 2), ("0052", 65.88, 9), ("00631L", 39.43, 15),
+                    ("0050", 113.11, 5), ("0055", 49.86, 13), ("0056", 56.71, 10),
+                    ("00911", 57.32, 10), ("00960", 22.24, 31), ("00875", 57.74, 9),
+                ],
+                "holdings": [
+                    ("0050", 149, 107.32, 113.11), ("0052", 1441, 61.01, 65.89),
+                    ("0053", 37, 244.54, 254.21), ("0055", 78, 49.97, 49.86),
+                    ("0056", 108, 56.46, 56.73), ("0057", 17, 323.43, 336.57),
+                    ("006201", 28, 46.33, 47.01), ("006203", 19, 197.48, 205.10),
+                    ("006208", 32, 249.46, 259.18), ("00631L", 2783, 35.26, 39.46),
+                    ("00690", 471, 75.60, 84.23), ("00692", 2, 90.50, 97.20),
+                    ("00875", 97, 55.13, 57.75), ("00960", 98, 22.62, 22.24),
+                ],
+                "warming": {"00960"},
+                "base_cash": 850188,
+            },
+            {
+                "eligible": [
+                    ("0053", 251.03, 0), ("0052", 64.91, 0), ("00631L", 38.58, 0),
+                    ("0050", 111.83, 0), ("006208", 255.90, 0), ("006201", 46.87, 0),
+                    ("0055", 50.21, 0), ("00911", 56.01, 0), ("0056", 56.70, 0),
+                    ("00875", 57.89, 0), ("00960", 22.69, 1),
+                ],
+                "holdings": [
+                    ("0050", 128, 102.16, 112.97), ("0052", 613, 60.71, 65.80),
+                    ("0053", 44, 228.82, 253.95), ("0055", 16, 46.88, 49.78),
+                    ("0056", 40, 53.35, 56.67), ("0057", 12, 298.75, 336.05),
+                    ("006201", 2, 46.00, 47.04), ("006203", 6, 186.33, 204.85),
+                    ("006208", 1, 245.00, 258.77), ("00631L", 1136, 35.06, 39.40),
+                    ("00690", 149, 74.14, 84.21), ("00692", 7, 90.57, 97.05),
+                    ("00830", 324, 88.59, 88.86), ("00861", 359, 89.94, 89.16),
+                    ("00875", 16, 54.13, 57.74), ("00876", 324, 91.12, 89.51),
+                    ("00910", 36, 76.47, 59.18), ("00911", 489, 56.73, 56.01),
+                    ("00941", 259, 28.27, 24.64), ("00960", 71, 21.62, 22.69),
+                    ("00988A", 847, 21.37, 16.85),
+                ],
+                "warming": {"00960"},
+                "base_cash": 166667,
+            },
+        ]
+
+        quantity_scales = (0.20, 0.35, 0.50, 0.75, 1.00, 1.50, 2.00, 3.00, 5.00, 8.00)
+        cost_shocks = (0.65, 0.90, 1.10, 1.35)
+        case = 0
+
+        for base_index, base in enumerate(baselines):
+            for qty_scale in quantity_scales:
+                for cost_shock in cost_shocks:
+                    case += 1
+                    eligible_rows = [
+                        {"symbol": symbol, "nav": nav, "app_shares": app_shares}
+                        for symbol, nav, app_shares in base["eligible"]
+                    ]
+                    data = {
+                        "snapshot_id": f"real-ark-scaled-{case}",
+                        "account": "sanitized-fixture@example.invalid",
+                        "eligible_value_zone": {"stocks": eligible_rows},
+                        "raw_value_zone": {"stocks": eligible_rows},
+                        "warming_zone": {
+                            "cross_table": [
+                                {"symbol": symbol, "is_warming": True}
+                                for symbol in base["warming"]
+                            ]
+                        },
+                        "holdings": [],
+                    }
+
+                    holdings = {}
+                    quotes = {}
+                    for symbol, base_qty, base_cost, base_nav in base["holdings"]:
+                        # 不保留真實原始庫存：股數至少做 3% deterministic distortion 再乘倍率。
+                        distortion = 0.97 if (sum(ord(ch) for ch in symbol) % 2) else 1.03
+                        qty = max(1, int(round(base_qty * qty_scale * distortion)))
+                        avg_cost = base_cost * cost_shock
+                        nav = base_nav * (0.985 if case % 3 == 0 else (1.015 if case % 3 == 1 else 1.0))
+                        bid = nav * (0.975 + (case % 7) * 0.008)
+                        odd_bid = bid * (1.004 if case % 2 else 0.996)
+                        ask = nav * (0.98 + (case % 5) * 0.009)
+                        odd_ask = ask * (0.996 if case % 2 else 1.004)
+                        holdings[symbol] = {"qty": qty, "avg_cost": avg_cost}
+                        quotes[symbol] = quote(
+                            price=nav,
+                            board_bid=bid,
+                            odd_bid=odd_bid,
+                            board_ask=ask,
+                            odd_ask=odd_ask,
+                        )
+                        data["holdings"].append({"symbol": symbol, "nav": nav})
+
+                    # 未持有但有效價值區的標的仍需要 quote。
+                    for symbol, nav, _ in base["eligible"]:
+                        if symbol not in quotes:
+                            quotes[symbol] = quote(
+                                price=nav,
+                                board_bid=nav * 0.995,
+                                odd_bid=nav * 0.996,
+                                board_ask=nav * 1.005,
+                                odd_ask=nav * 1.004,
+                            )
+
+                    cash = base["base_cash"] * qty_scale * (0.35 if case % 4 == 0 else 1.0)
+
+                    # 每 5 組刻意切成 App 強制降水位，且調節目標跨 5%~35% 持股市值。
+                    if case % 5 == 0:
+                        holding_value = sum(
+                            holdings[symbol]["qty"] * quotes[symbol]["reference_price"]
+                            for symbol in holdings
+                        )
+                        target_ratio = (0.05, 0.12, 0.20, 0.27, 0.35)[(case // 5) % 5]
+                        data["risk_control"] = {
+                            "risk_reduction_required": True,
+                            "app_recommended_holding_amount": max(
+                                0,
+                                holding_value * (1 - target_ratio),
+                            ),
+                        }
+
+                    plan = build_strategy_plan(data, portfolio(cash, holdings), quotes)
+
+                    sold_by_symbol = {}
+                    for leg in plan["planned_sells"]:
+                        sold_by_symbol[leg["symbol"]] = sold_by_symbol.get(leg["symbol"], 0) + leg["quantity"]
+                        self.assertGreater(leg["quantity"], 0)
+                        self.assertIn(leg["market"], ("整股", "零股"))
+                    for symbol, sold_qty in sold_by_symbol.items():
+                        self.assertLessEqual(sold_qty, holdings[symbol]["qty"])
+
+                    reduction = plan.get("waterline_reduction") or {}
+                    if data.get("risk_control", {}).get("risk_reduction_required"):
+                        self.assertEqual(reduction.get("type"), "APP_RISK_REDUCTION")
+                        self.assertTrue(plan["suppress_buys"])
+                        self.assertEqual(plan["rotation_multiplier"], 0)
+                        self.assertEqual(build_affordable_buys(plan, cash, plan["planned_sell_amount"]), [])
+                        self.assertGreaterEqual(
+                            plan["planned_sell_amount"] + 0.01,
+                            reduction["target_amount"],
+                        )
+                    elif base_index == 1:
+                        # 第二個真實 snapshot 幾乎所有 app_shares=0，應進集中度降水位。
+                        self.assertEqual(reduction.get("type"), "CONCENTRATION_REDUCTION")
+                        self.assertEqual(plan["rotation_multiplier"], 0)
+                        self.assertTrue(plan["base_only_buys"])
+                        profit_sources = {
+                            leg["symbol"] for leg in reduction["planned_sells"]
+                            if leg["reason_code"] in {
+                                "CONCENTRATION_PROFIT_REDUCTION",
+                                "CONCENTRATION_PROFIT_FALLBACK",
+                            }
+                        }
+                        self.assertLessEqual(len(profit_sources), 1)
+
+                    buys = build_affordable_buys(
+                        plan,
+                        cash,
+                        plan["planned_sell_amount"] if not plan.get("suppress_buys") else 0,
+                    )
+                    for leg in buys:
+                        self.assertIn(
+                            leg["symbol"],
+                            {row["symbol"] for row in eligible_rows},
+                        )
+
+        self.assertEqual(case, 80)
+
     def test_spiral_uses_positive_return_highest_premium_seller_and_app_quantity(self):
         data = snapshot(eligible=("0050", "006208"), shares=10)
         data["app_adjustments"] = {"stocks": [
