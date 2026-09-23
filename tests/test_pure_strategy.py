@@ -204,6 +204,20 @@ class PureStrategyTests(unittest.TestCase):
         self.assertEqual(result["spiral_plan"]["seller_symbol"], "0050")
         self.assertEqual(result["spiral_plan"]["buyer_symbol"], "006208")
 
+    def test_spiral_buyer_does_not_need_existing_holding(self):
+        data = snapshot(eligible=("0050", "006208"), shares=10)
+        data["app_adjustments"] = {"stocks": [{"symbol": "0050", "app_reduce_min_shares": 20}]}
+        plan = build_strategy_plan(data, portfolio(100_000, {
+            "0050": {"qty": 100, "avg_cost": 90},
+        }), {
+            "0050": quote(board_bid=102, board_ask=103, odd_bid=102, odd_ask=103),
+            "006208": quote(board_bid=99, board_ask=99, odd_bid=99, odd_ask=99),
+        })
+        spiral = plan["spiral_plan"]
+        self.assertIsNotNone(spiral)
+        self.assertEqual(spiral["seller_symbol"], "0050")
+        self.assertEqual(spiral["buyer_symbol"], "006208")
+
     def test_spiral_buyer_must_be_in_eligible_value_zone(self):
         data = snapshot(eligible=("0050",), shares=10)
         data["raw_value_zone"]["stocks"].append({"symbol": "9999", "nav": 100, "app_shares": 10})
