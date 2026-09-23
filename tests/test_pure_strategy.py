@@ -1,3 +1,4 @@
+import random
 import unittest
 from datetime import datetime
 
@@ -340,6 +341,148 @@ class PureStrategyTests(unittest.TestCase):
         plan = build_strategy_plan(data, portfolio(10_000, {}), {"0050": quote()})
         self.assertEqual(plan["x_amount"], 0)
         self.assertEqual(build_affordable_buys(plan, 10_000), [])
+
+    def test_waterline_exactly_fifty_is_low(self):
+        plan = build_strategy_plan(
+            snapshot(),
+            portfolio(10_000, {"9999": {"qty": 100, "avg_cost": 100}}),
+            {"0050": quote(), "9999": quote()},
+        )
+        self.assertEqual(plan["actual_waterline_pct"], 50.0)
+        self.assertEqual(plan["mode"], "LOW")
+
+    def test_waterline_just_above_fifty_is_high(self):
+        plan = build_strategy_plan(
+            snapshot(),
+            portfolio(9_999, {"9999": {"qty": 100, "avg_cost": 100}}),
+            {"0050": quote(), "9999": quote()},
+        )
+        self.assertGreater(plan["actual_waterline_pct"], 50.0)
+        self.assertEqual(plan["mode"], "HIGH")
+
+    def test_minus_five_percent_boundary_is_p1(self):
+        plan = build_strategy_plan(
+            snapshot(),
+            portfolio(0, {"9999": {"qty": 1000, "avg_cost": 100}}),
+            {"0050": quote(), "9999": quote(price=95, board_bid=95, odd_bid=95)},
+        )
+        self.assertEqual(plan["rotation_candidates"][0]["priority"], "P1")
+
+    def test_just_better_than_minus_five_percent_is_p2(self):
+        plan = build_strategy_plan(
+            snapshot(),
+            portfolio(0, {"9999": {"qty": 1000, "avg_cost": 100}}),
+            {"0050": quote(), "9999": quote(price=95.0001, board_bid=95.0001, odd_bid=95.0001)},
+        )
+        self.assertEqual(plan["rotation_candidates"][0]["priority"], "P2")
+
+    def test_p4_price_exactly_nav_is_allowed(self):
+        plan = build_strategy_plan(
+            snapshot(),
+            portfolio(0, {"0050": {"qty": 1000, "avg_cost": 90}}),
+            {"0050": quote(board_bid=100, odd_bid=100)},
+        )
+        self.assertTrue(plan["planned_sells"])
+        self.assertTrue(all(leg["limit_price"] >= 100 for leg in plan["planned_sells"]))
+
+    def test_p4_price_below_nav_is_blocked(self):
+        plan = build_strategy_plan(
+            snapshot(),
+            portfolio(0, {"0050": {"qty": 999, "avg_cost": 90}}),
+            {"0050": quote(board_bid=99.9999, odd_bid=99.9999)},
+        )
+        self.assertEqual(plan["planned_sells"], [])
+
+    def test_share_boundary_999_1000_1001_uses_legal_markets(self):
+        for qty in (999, 1000, 1001):
+            with self.subTest(qty=qty):
+                plan = build_strategy_plan(
+                    snapshot(),
+                    portfolio(0, {"9999": {"qty": qty, "avg_cost": 90}}),
+                    {"0050": quote(), "9999": quote(board_bid=100, odd_bid=99)},
+                )
+                legs = plan["planned_sells"]
+                self.assertEqual(sum(leg["quantity"] for leg in legs), min(qty, sum(leg["quantity"] for leg in legs)))
+                self.assertTrue(all(0 < leg["quantity"] <= qty for leg in legs))
+                self.assertTrue(all(leg["market"] in ("整股", "零股") for leg in legs))
+
+    def test_planned_sell_never_exceeds_original_holding(self):
+        plan = build_strategy_plan(
+            snapshot(shares=50),
+            portfolio(0, {"9999": {"qty": 1234, "avg_cost": 90}}),
+            {"0050": quote(), "9999": quote()},
+        )
+        sold = sum(leg["quantity"] for leg in plan["planned_sells"] if leg["symbol"] == "9999")
+        self.assertLessEqual(sold, 1234)
+
+    def test_randomized_strategy_invariants(self):
+        rng = random.Random(20260923)
+        for case in range(1000):
+            eligible = ("0050", "006208", "00878")
+            rows = []
+            quotes = {}
+            holdings = {}
+            for index, symbol in enumerate(eligible):
+                nav = rng.uniform(30, 150)
+                shares = rng.randint(0, 800)
+                rows.append({"symbol": symbol, "nav": nav, "app_shares": shares})
+                bid = nav * rng.uniform(0.97, 1.03)
+                ask = nav * rng.uniform(0.97, 1.03)
+                odd_bid = bid * rng.uniform(0.995, 1.005)
+                odd_ask = ask * rng.uniform(0.995, 1.005)
+                quotes[symbol] = quote(price=nav, board_bid=bid, board_ask=ask, odd_bid=odd_bid, odd_ask=odd_ask)
+                if rng.random() < 0.7:
+                    qty = rng.randint(1, 3000)
+                    avg = nav * rng.uniform(0.7, 1.3)
+                    holdings[symbol] = {"qty": qty, "avg_cost": avg}
+
+            for symbol in ("1111", "2222", "3333"):
+                if rng.random() < 0.6:
+                    nav = rng.uniform(30, 150)
+                    qty = rng.randint(1, 3000)
+                    avg = nav * rng.uniform(0.7, 1.3)
+                    holdings[symbol] = {"qty": qty, "avg_cost": avg}
+                    bid = nav * rng.uniform(0.97, 1.03)
+                    ask = nav * rng.uniform(0.97, 1.03)
+                    quotes[symbol] = quote(
+                        price=nav, board_bid=bid, board_ask=ask,
+                        odd_bid=bid * rng.uniform(0.995, 1.005),
+                        odd_ask=ask * rng.uniform(0.995, 1.005),
+                    )
+
+            data = {
+                "snapshot_id": f"random-{case}",
+                "account": "fixture@example.invalid",
+                "eligible_value_zone": {"stocks": rows},
+                "raw_value_zone": {"stocks": rows},
+                "warming_zone": {"cross_table": []},
+            }
+            cash = rng.uniform(0, 500_000)
+            plan = build_strategy_plan(data, portfolio(cash, holdings), quotes)
+
+            self.assertIn(plan["mode"], ("LOW", "HIGH"))
+            self.assertGreaterEqual(plan["rotation_multiplier"], 0)
+            self.assertLessEqual(plan["rotation_multiplier"], 5)
+            if plan["mode"] == "LOW":
+                self.assertEqual(plan["rotation_multiplier"], 0)
+
+            original_qty = {symbol: row["qty"] for symbol, row in holdings.items()}
+            sold_by_symbol = {}
+            for leg in plan["planned_sells"]:
+                self.assertGreater(leg["quantity"], 0)
+                sold_by_symbol[leg["symbol"]] = sold_by_symbol.get(leg["symbol"], 0) + leg["quantity"]
+                if leg.get("reason_code") == "P4":
+                    nav = next(row["nav"] for row in rows if row["symbol"] == leg["symbol"])
+                    self.assertGreaterEqual(leg["limit_price"], nav)
+            for symbol, sold in sold_by_symbol.items():
+                self.assertLessEqual(sold, original_qty[symbol])
+
+            spiral = plan.get("spiral_plan")
+            if spiral:
+                self.assertNotEqual(spiral["seller_symbol"], spiral["buyer_symbol"])
+                self.assertIn(spiral["buyer_symbol"], eligible)
+                self.assertGreater(spiral["premium_gap_pct"], 0.5)
+                self.assertLessEqual(spiral["seller_planned_qty"], original_qty[spiral["seller_symbol"]])
 
     def test_spiral_uses_positive_return_highest_premium_seller_and_app_quantity(self):
         data = snapshot(eligible=("0050", "006208"), shares=10)
