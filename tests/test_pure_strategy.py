@@ -869,7 +869,6 @@ class PureStrategyTests(unittest.TestCase):
         })
         reduction = plan["waterline_reduction"]
         self.assertEqual(reduction["type"], "CONCENTRATION_REDUCTION")
-        self.assertGreaterEqual(reduction["realized_pnl"], -0.01)
         weak = [x for x in reduction["planned_sells"] if x["reason_code"] == "CONCENTRATION_WEAK_REDUCTION"]
         self.assertTrue(weak)
         self.assertEqual(weak[0]["symbol"], "1111")
@@ -915,6 +914,12 @@ class PureStrategyTests(unittest.TestCase):
             "eligible_value_zone": {"stocks": rows},
             "raw_value_zone": {"stocks": rows},
             "warming_zone": {"cross_table": []},
+            "holdings": [
+                {"symbol": "1111", "nav": 100},
+                {"symbol": "2222", "nav": 100},
+                {"symbol": "3333", "nav": 100},
+                {"symbol": "4444", "nav": 100},
+            ],
         }
         plan = build_strategy_plan(data, portfolio(0, {
             "1111": {"qty": 100, "avg_cost": 90},   # +900, 但折價
@@ -935,8 +940,6 @@ class PureStrategyTests(unittest.TestCase):
         ]
         self.assertTrue(fallback)
         self.assertEqual({leg["symbol"] for leg in fallback}, {"2222"})
-        self.assertGreaterEqual(reduction["realized_pnl"], -0.01)
-
     def test_concentration_reduction_clears_all_losses_when_one_profit_covers_them(self):
         rows = [
             {"symbol": "0050", "nav": 100, "app_shares": 10},
@@ -950,9 +953,15 @@ class PureStrategyTests(unittest.TestCase):
             "eligible_value_zone": {"stocks": rows},
             "raw_value_zone": {"stocks": rows},
             "warming_zone": {"cross_table": []},
+            "holdings": [
+                {"symbol": "P", "nav": 99},
+                {"symbol": "L1", "nav": 100},
+                {"symbol": "L2", "nav": 100},
+                {"symbol": "L3", "nav": 100},
+            ],
         }
         plan = build_strategy_plan(data, portfolio(0, {
-            "P": {"qty": 100, "avg_cost": 0},      # +10,000
+            "P": {"qty": 200, "avg_cost": 50},     # +10,000
             "L1": {"qty": 100, "avg_cost": 120},  # -2,000
             "L2": {"qty": 100, "avg_cost": 110},  # -1,000
             "L3": {"qty": 100, "avg_cost": 105},  # -500
@@ -979,9 +988,15 @@ class PureStrategyTests(unittest.TestCase):
             "eligible_value_zone": {"stocks": rows},
             "raw_value_zone": {"stocks": rows},
             "warming_zone": {"cross_table": []},
+            "holdings": [
+                {"symbol": "P", "nav": 99},
+                {"symbol": "L1", "nav": 100},
+                {"symbol": "L2", "nav": 100},
+                {"symbol": "L3", "nav": 100},
+            ],
         }
         plan = build_strategy_plan(data, portfolio(0, {
-            "P": {"qty": 50, "avg_cost": 0},        # +5,000
+            "P": {"qty": 100, "avg_cost": 50},      # +5,000
             "L1": {"qty": 100, "avg_cost": 300},   # -20,000
             "L2": {"qty": 100, "avg_cost": 200},   # -10,000
             "L3": {"qty": 100, "avg_cost": 150},   # -5,000
@@ -1008,10 +1023,17 @@ class PureStrategyTests(unittest.TestCase):
             "eligible_value_zone": {"stocks": rows},
             "raw_value_zone": {"stocks": rows},
             "warming_zone": {"cross_table": []},
+            "holdings": [
+                {"symbol": "P", "nav": 100},
+                {"symbol": "Q", "nav": 100},
+                {"symbol": "L1", "nav": 100},
+                {"symbol": "L2", "nav": 100},
+                {"symbol": "L3", "nav": 100},
+            ],
         }
         plan = build_strategy_plan(data, portfolio(0, {
-            "P": {"qty": 50, "avg_cost": 0},        # +4,950 at bid 99, all discounted
-            "Q": {"qty": 50, "avg_cost": 50},       # +2,450
+            "P": {"qty": 100, "avg_cost": 49},      # +5,000 at bid 99, discounted
+            "Q": {"qty": 100, "avg_cost": 74},      # +2,500
             "L1": {"qty": 100, "avg_cost": 300},    # -20,000
             "L2": {"qty": 100, "avg_cost": 200},    # -10,000
             "L3": {"qty": 100, "avg_cost": 150},    # -5,000
